@@ -1,3 +1,21 @@
+/**
+ * PeridynoBridge.cu — GPU 弱可压缩 SPH 流体 + 三角面 FSI 耦合
+ *
+ * 【整体模型】
+ *   流体：WCSPH（Weakly Compressible SPH），Tait 状态方程求压，Poly6/Spiky 核。
+ *   固体：FEM 鱼体表面三角 mesh 作为移动边界；力回传到各 FEM 顶点。
+ *   耦合：显式子步弱耦合（每 FEM 帧内 n_substeps 次 SPH 子步，帧末时间平均力）。
+ *
+ * 【每帧主循环】（ComputeFluidForces）
+ *   1. 更新鱼体三角面心/法向 → 重建面网格
+ *   2. 重复 n_substeps 次：
+ *      a. 重建流体均匀网格 → 密度/压力 → SPH 内力
+ *      b. 三角面排斥（非穿透）+ 面基水压力积分 → 边界力
+ *      c. 域边界约束 + 来流 ramp → 显式积分
+ *   3. 子步力求平均 → 可选顶点力截断 → 返回 Eigen::VectorXd 给 FEM
+ *
+ * 【单位】SI：m, kg, s, N, Pa
+ */
 #include "PeridynoBridge.h"
 
 #include <cuda_runtime.h>
@@ -8,9 +26,8 @@
 #include <iostream>
 #include <cstring>
 
-// ===== 流固耦合参数 =====
-// ENABLE_HYDRO_PRESSURE: 启用 SPH 压力积分水动力 (0/1)
-// HYDRO_FORCE_SCALE:    全局水动力缩放 (1.0=全量)
+// ===== 编译期开关 =====
+// ENABLE_HYDRO_PRESSURE: 是否启用水压力积分力（1=启用，0=仅接触排斥）
 #define ENABLE_HYDRO_PRESSURE 1
 
 #ifndef M_PI
@@ -47,20 +64,24 @@ __host__ __device__ inline float3 normalize(const float3& v) {
 
 // int3 由 CUDA vector_types.h 提供
 
+// 均匀网格加速：每格最多存放的粒子/三角面数量（超出则丢弃，影响精度）
 #define MAX_PARTICLES_PER_CELL  64
 #define MAX_FACES_PER_CELL      32
+// 光滑长度 h = particle_spacing × 该比值（默认 h = 2Δx）
 #define SPH_KERNEL_RADIUS_RATIO 2.0f
 
+/** 均匀网格参数，用于 O(N) 邻域搜索 */
 struct GridParams {
-    float3 grid_min;
-    float  cell_size;
-    float  inv_cell_size;
-    int3   grid_dim;
-    int    total_cells;
+    float3 grid_min;       // 网格原点（含 ghost 层）
+    float  cell_size;      // 单元边长，通常取 h
+    float  inv_cell_size;  // 1/cell_size
+    int3   grid_dim;       // 各轴格数
+    int    total_cells;    // 总格数 = dx×dy×dz
 };
 
+/** GPU 端全部仿真状态（Pimpl，与 PeridynoBridge 公共接口分离） */
 struct PeridynoBridge::Impl {
-    // ---- 流体粒子 (GPU) ----
+    // ---- 流体 SPH 粒子 (GPU) ----
     float3* d_positions  = nullptr;
     float3* d_velocities = nullptr;
     float*  d_densities  = nullptr;
@@ -68,73 +89,83 @@ struct PeridynoBridge::Impl {
     float3* d_forces     = nullptr;
     int num_particles = 0;
 
-    // ---- 边界顶点 (GPU) ----
+    // ---- FEM 鱼体边界顶点 (GPU)：每帧由 SetFishBoundary H2D 上传 ----
     float3* d_boundary_vertices   = nullptr;
     float3* d_boundary_velocities = nullptr;
     int     num_boundary_vertices = 0;
 
-    // ---- 三角面数据 (GPU, 新增) ----
-    int3*   d_face_indices  = nullptr;  // [num_faces] 顶点索引三元组
-    float3* d_face_centers  = nullptr;  // [num_faces] 面心 (每帧更新)
-    float3* d_face_normals  = nullptr;  // [num_faces] 面法向量 (每帧更新)
-    float*  d_face_areas    = nullptr;  // [num_faces] 面面积 (初始化时预计算，不变)
+    // ---- 鱼体表面三角面 (GPU) ----
+    int3*   d_face_indices  = nullptr;  // [num_faces] 三个顶点索引 (i0,i1,i2)
+    float3* d_face_centers  = nullptr;  // [num_faces] 面心，每帧 update_face_data_kernel 更新
+    float3* d_face_normals  = nullptr;  // [num_faces] 单位法向，每帧更新
+    float*  d_face_areas    = nullptr;  // [num_faces] 面积，仅在拓扑首次上传时计算（当前未随变形更新）
     int     num_faces = 0;
 
-    // ---- 三角面网格 (GPU, 每帧重建) ----
+    // ---- 三角面均匀网格 (GPU, 每帧重建，用于粒子→面 邻域搜索) ----
     GridParams face_grid_params;
     int* d_face_grid_counts   = nullptr;
     int* d_face_grid_particles = nullptr;  // 存储 face 索引
     bool face_grid_allocated = false;
 
-    // ---- 力累积缓冲区 (GPU) ----
-    float3* d_boundary_forces_sub   = nullptr;  // 每子步的边界力 (N_vert)
-    float3* d_boundary_forces_frame = nullptr;  // 帧累积边界力 (N_vert)
-    float3* h_boundary_forces_frame = nullptr;  // CPU 拷贝
+    // ---- FSI 边界力缓冲 (GPU/CPU) ----
+    float3* d_boundary_forces_sub   = nullptr;  // 单个子步内累积的 FEM 顶点力
+    float3* d_boundary_forces_frame = nullptr;  // 整帧所有子步力之和（帧末再除以 n_substeps）
+    float3* h_boundary_forces_frame = nullptr;  // D2H 后 CPU 侧处理（平均/截断/ramp）
 
-    // ---- 流体均匀网格 (GPU) ----
+    // ---- 流体 SPH 均匀网格 (GPU, 每子步重建) ----
     int* d_grid_counts    = nullptr;
     int* d_grid_cell_start = nullptr;
     int* d_grid_cell_end  = nullptr;
     int* d_grid_particles = nullptr;
     GridParams grid_params;
 
-    // ---- 参数 ----
-    float particle_spacing = 0.04f;
-    float h     = 0.08f;
-    float h2    = 0.0064f;
-    float mass  = 0.064f;
-    float rest_density = 1000.0f;
-    float viscosity    = 0.01f;
-    float sound_speed  = 20.0f;
-    float gravity_y    = 0.0f;
-    float3 flow_velocity   = make_float3(0, 0, 0);
-    float  flow_ramp_time  = 0.5f;
-    float  hydro_force_scale = 1.0f;
-    float  max_vertex_force  = 0.0f;
-    float  current_time    = 0.0f;
-    float  last_ramp       = 0.0f;
-    int    frame_count     = 0;
+    // ---- SPH 与 FSI 物理参数（Initialize 时由外部传入覆盖）----
+    float particle_spacing = 0.04f;   // Δx：粒子初始间距 [m]
+    float h     = 0.08f;              // 核支撑半径 h = 2Δx [m]
+    float h2    = 0.0064f;            // h²，Poly6 核用
+    float mass  = 0.064f;             // 单粒子质量 m = ρ₀ Δx³ [kg]
+    float rest_density = 1000.0f;     // 参考密度 ρ₀ [kg/m³]（近似水）
+    float viscosity    = 0.01f;       // 人工粘性系数 μ（非真实动力粘度）[Pa·s 量级]
+    float sound_speed  = 20.0f;       // 状态方程声速 c_s [m/s]，控制可压缩性
+    float gravity_y    = 0.0f;        // 重力加速度 g_y [m/s²]（当前为 0）
+    float3 flow_velocity   = make_float3(0, 0, 0);  // 目标来流速度 [m/s]
+    float  flow_ramp_time  = 0.5f;    // 来流线性 ramp 时间 [s]，ramp = min(t/T, 1)
+    float  hydro_force_scale = 1.0f;  // 水压力积分全局缩放（Environment 中常设为 0.035）
+    float  max_vertex_force  = 0.0f;  // 单顶点力模长上限 [N]，0=不截断
+    float  current_time    = 0.0f;    // 流体仿真累计时间 [s]
+    float  last_ramp       = 0.0f;    // 上一帧 ramp 系数，供诊断/二次缩放
+    int    frame_count     = 0;       // 已计算帧数
 
-    // 子步进 (建议二)
+    // 子步进：每个 FEM 时间步内 SPH 积分次数（Environment 默认 24）
     int n_substeps = 4;
 
-    // 接触排斥参数 (建议六: 与非穿透力分离)
-    float contact_stiffness = 10.0f;   // 法向排斥刚度 (N/m)
-    float contact_damping   = 2.0f;    // 法向阻尼
+    // 三角面非穿透接触（弹簧-阻尼，与流体压力分离）
+    float contact_stiffness = 10.0f;   // 法向刚度 k [N/m]
+    float contact_damping   = 2.0f;    // 法向阻尼系数 β（无量纲，乘以接近速度）
 
     float3 domain_min_f3, domain_max_f3;
     Eigen::Vector3d domain_min, domain_max;
     bool initialized = false;
 };
 
-// ==================== SPH 核函数 ====================
+// ==================== SPH 核函数（标准 WCSPH 形式）====================
 
+/**
+ * Poly6 核 W(r,h)：用于密度求和
+ *   W(r) = (315 / 64πh⁹) · (h² - r²)³,  r < h
+ * 密度：ρ_i = Σ_j m_j W(|x_i - x_j|, h)
+ */
 __device__ float poly6_kernel(float r2, float h, float h2) {
     if (r2 >= h2) return 0.0f;
     float diff = h2 - r2;
     return (315.0f / (64.0f * M_PI * powf(h, 9))) * diff * diff * diff;
 }
 
+/**
+ * Spiky 核梯度 ∇W：用于压力梯度力
+ *   ∇W = -(45 / πh⁶) · (h - r)² · (r_vec / r)
+ * 压力力：f_p = -m · (p_i+p_j)/(2ρ_j) · ∇W
+ */
 __device__ float3 spiky_grad(const float3& r_vec, float r, float h) {
     if (r < 1e-8f || r >= h) return make_float3(0, 0, 0);
     float diff = h - r;
@@ -142,12 +173,17 @@ __device__ float3 spiky_grad(const float3& r_vec, float r, float h) {
     return r_vec * (coeff / r);
 }
 
+/**
+ * 粘性核拉普拉斯 ∇²W：用于人工粘性
+ *   ∇²W = (45 / πh⁶) · (h - r)
+ * 粘性力：f_v = m · μ · (v_j - v_i)/ρ_j · ∇²W
+ */
 __device__ float viscosity_laplacian(float r, float h) {
     if (r >= h) return 0.0f;
     return 45.0f / (M_PI * h * h * h * h * h * h) * (h - r);
 }
 
-// ---- 构建流体粒子网格 ----
+// ---- 将每个流体粒子插入均匀网格（并行 atomic 计数）----
 __global__ void build_grid_kernel(
     const float3* positions, int* grid_counts, int* grid_particles,
     GridParams gp, int num_particles)
@@ -164,7 +200,14 @@ __global__ void build_grid_kernel(
         grid_particles[cell * MAX_PARTICLES_PER_CELL + slot] = idx;
 }
 
-// ---- 计算密度和压力 ----
+/**
+ * 计算每个粒子的 SPH 密度与 Tait 状态方程压力
+ *
+ * 密度：ρ_i = max(Σ_j m_j W_ij, ρ₀)
+ * 压力（Tait EOS, γ=7）：
+ *   p_i = max( (ρ₀ c_s² / 7) · [ (ρ_i/ρ₀)^7 - 1 ], 0 )
+ * 仅保留非负压力（弱可压缩近似）
+ */
 __global__ void compute_density_pressure_kernel(
     const float3* positions, float* densities, float* pressures,
     const int* grid_particles, GridParams gp,
@@ -195,7 +238,15 @@ __global__ void compute_density_pressure_kernel(
     pressures[idx] = fmaxf((rest_density * sound_speed * sound_speed / 7.0f) * (powf(rho_ratio, 7.0f) - 1.0f), 0.0f);
 }
 
-// ---- 计算 SPH 流体内力 ----
+/**
+ * 计算 SPH 粒子间压力力 + 人工粘性 + 重力
+ *
+ * 对称压力项（Monaghan 形式，j>idx 避免重复，力反加到 j）：
+ *   f_p = -m (p_i+p_j)/(2ρ_j) ∇W_ij
+ * 粘性项：
+ *   f_v = m μ (v_j-v_i)/ρ_j ∇²W_ij
+ * 重力：f_g = (0, m·g_y, 0)
+ */
 __global__ void compute_sph_forces_kernel(
     const float3* positions, const float3* velocities,
     const float* densities, const float* pressures,
@@ -236,7 +287,11 @@ __global__ void compute_sph_forces_kernel(
 
 // ==================== 三角形面数据更新 ====================
 
-// 从当前顶点位置更新三角面的法向量、面心
+/**
+ * 根据当前 FEM 顶点位置更新每个三角面的面心与单位法向
+ *   面心 c = (v0+v1+v2)/3
+ *   法向 n = normalize((v1-v0) × (v2-v0))  （未做一致 outward 定向）
+ */
 __global__ void update_face_data_kernel(
     const float3* vertices,
     const int3*   face_indices,
@@ -266,7 +321,7 @@ __global__ void update_face_data_kernel(
     face_normals[f] = n;
 }
 
-// ---- 构建三角面网格 ----
+// ---- 将三角面心插入面网格，供 repulsion 核做粒子→面邻域搜索 ----
 __global__ void build_face_grid_kernel(
     const float3* face_centers,
     int*  grid_counts,
@@ -288,8 +343,12 @@ __global__ void build_face_grid_kernel(
 
 // ==================== 建议一：三角形最近点 + 重心坐标力分配 ====================
 
-// 计算点 P 到三角形 ABC 的最近点 Q，以及重心坐标 (u,v,w), Q = u*A+v*B+w*C
-// 基于 Möller 的 "Distance Between Point and Triangle in 3D" 算法
+/**
+ * 计算点 P 到三角形 ABC 的最近点 Q 及重心坐标 (u,v,w)
+ *   Q = u·A + v·B + w·C,  u+v+w=1
+ * 算法：Möller, "Fast Minimum Distance Between a Point and a Triangle"
+ * 用途：将接触力按 (u,v,w) 分配到三个 FEM 顶点
+ */
 __device__ void closest_point_on_triangle(
     const float3& A, const float3& B, const float3& C,
     const float3& P,
@@ -369,11 +428,16 @@ __device__ void closest_point_on_triangle(
     w = t;
 }
 
-// 三角形排斥力核函数 (建议一 + 建议六前半)
-// - 每个流体粒子查找邻近三角面
-// - 计算最近点 + 重心坐标
-// - 仅施加法向非穿透接触力（不包含流体压力）
-// - 力按重心坐标(barycentric weights)分配到3个FEM顶点
+/**
+ * 三角面非穿透接触排斥力（FSI 耦合之一）
+ *
+ * 对每个流体粒子，在面网格邻域内搜索三角面：
+ *   1. 求粒子到三角面的最近点 Q 及重心坐标 (u,v,w)
+ *   2. 仅当粒子在面外侧 (r·n > 0) 且 dist < repulsion_h 时施加力
+ *   3. 穿透深度 δ = max(repulsion_h - dist, 0)
+ *   4. 法向接触力：F_n = k·δ·(1 + β·max(v_rel·n,0))·n
+ *   5. 流体 +F_n；FEM 顶点 -F_n·(u,v,w)（牛顿第三定律）
+ */
 __global__ void compute_triangle_repulsion_kernel(
     const float3* fluid_positions,
     const float3* fluid_velocities,
@@ -467,10 +531,13 @@ __global__ void compute_triangle_repulsion_kernel(
     fluid_forces[idx] = fluid_forces[idx] + f_total;
 }
 
-// ==================== 建议六：流体压力积分核函数 ====================
-
-// 面基核函数：对每个三角面，从邻近流体粒子插值压力，
-// 计算水动力压力 force = p_avg * area * normal，分配到3个FEM顶点
+/**
+ * 面基 SPH 水压力积分力（FSI 耦合之二）
+ *
+ * 在面心附近插值流体压力 p_avg，若 p_avg>0：
+ *   F_hydro = p_avg · A_f · hydro_scale · n_f
+ * 反作用力 -F_hydro/3 均分到三个 FEM 顶点
+ */
 __global__ void compute_hydro_pressure_kernel(
     const float3* fluid_positions,
     const float*  fluid_pressures,
@@ -564,8 +631,12 @@ __global__ void compute_hydro_pressure_kernel(
     (void)num_particles;
 }
 
-// ==================== 域边界约束 ====================
-
+/**
+ * 流体域边界条件（周期性来流 + 侧壁反射）
+ *
+ * z 方向（主流向）：超出上边界则 z -= L_z 并重置速度为 ramped_flow（周期通道）
+ * x/y 方向：在 margin 内 clamp 位置，法向速度反射并乘以 damping（软壁）
+ */
 __global__ void constrain_domain_kernel(
     float3* positions, float3* velocities,
     float3 domain_min, float3 domain_max,
@@ -607,6 +678,10 @@ __global__ void constrain_domain_kernel(
     velocities[idx] = v;
 }
 
+/**
+ * 来流速度线性混合：v ← (1-ramp)·v + ramp·v_target
+ * 与子步内 ramped_flow 配合，使流体逐渐加速到目标来流
+ */
 __global__ void apply_ramped_flow_kernel(
     float3* velocities, float3 target_flow, float ramp, int num_particles)
 {
@@ -620,7 +695,13 @@ __global__ void apply_ramped_flow_kernel(
         v.z * one_minus + target_flow.z * ramp);
 }
 
-// ---- 积分 ----
+/**
+ * 显式 Euler 积分（子步 dt_sub）
+ *   a = F / m
+ *   v ← (v + a·dt) · damping     （damping=0.999 数值耗散）
+ *   x ← x + v·dt
+ * 加速度分量 clamp 到 ±1e4 防止爆炸
+ */
 __global__ void integrate_kernel(
     float3* positions, float3* velocities,
     const float3* forces, const float* densities,
@@ -665,12 +746,24 @@ __global__ void accumulate_forces_kernel(
 
 #define CUDA_SAFE_FREE(ptr) do { if (ptr) { cudaFree(ptr); ptr = nullptr; } } while(0)
 
-// ==================== 公共接口 ====================
+// ==================== 公共接口（CPU 侧调度 GPU 核函数）====================
 
 PeridynoBridge::PeridynoBridge() : m_impl(new Impl()), m_initialized(false) {}
 
 PeridynoBridge::~PeridynoBridge() { Destroy(); delete m_impl; }
 
+/**
+ * 初始化流体域与 SPH 参数
+ *
+ * @param domain_min/max     流体计算域 AABB [m]
+ * @param particle_spacing   粒子间距 Δx [m] → h=2Δx, m=ρ₀Δx³
+ * @param flow_velocity      目标来流速度 [m/s]（Environment: (0,0,-0.05)）
+ * @param rest_density       参考密度 ρ₀ [kg/m³]（默认 1000，近似水）
+ * @param viscosity          人工粘性 μ（默认 0.01）
+ * @param sound_speed        Tait EOS 声速 c_s [m/s]（默认 20）
+ * @param boundary_thickness 预留参数（当前未直接使用）
+ * @param exclusion_*        鱼体 AABB 排除区，避免流体粒子初始嵌入鱼体
+ */
 void PeridynoBridge::Initialize(
     const Eigen::Vector3d& domain_min, const Eigen::Vector3d& domain_max,
     float particle_spacing,
@@ -699,9 +792,9 @@ void PeridynoBridge::Initialize(
     p.particle_spacing = particle_spacing;
     p.rest_density = rest_density; p.viscosity = viscosity;
     p.sound_speed = sound_speed;
-    p.h  = particle_spacing * SPH_KERNEL_RADIUS_RATIO;
+    p.h  = particle_spacing * SPH_KERNEL_RADIUS_RATIO;  // 光滑长度 h = 2Δx
     p.h2 = p.h * p.h;
-    p.mass = rest_density * particle_spacing * particle_spacing * particle_spacing;
+    p.mass = rest_density * particle_spacing * particle_spacing * particle_spacing;  // m = ρ₀Δx³
     p.flow_velocity = {(float)flow_velocity.x(), (float)flow_velocity.y(), (float)flow_velocity.z()};
 
     // 同步子步进和接触参数
@@ -749,6 +842,7 @@ void PeridynoBridge::Initialize(
               << std::endl;
 }
 
+/** 在规则网格上生成流体粒子，跳过鱼体 exclusion AABB 内的格点 */
 void PeridynoBridge::InitFluidParticles()
 {
     auto& p = *m_impl;
@@ -887,6 +981,16 @@ void PeridynoBridge::Destroy()
     m_initialized = false;
 }
 
+/**
+ * 上传 FEM 鱼体边界（每 FEM 帧调用一次）
+ *
+ * @param surface_vertices   全部 FEM 顶点位置 (3×N)，double→float H2D
+ * @param surface_velocities 对应顶点速度
+ * @param surface_faces      表面三角面索引 (14284 个面)
+ *
+ * 拓扑变化时：分配 GPU 缓冲、上传面索引、预计算初始面积
+ * 每帧：上传最新顶点位置/速度供 FSI 使用
+ */
 void PeridynoBridge::SetFishBoundary(
     const Eigen::VectorXd& surface_vertices,
     const Eigen::VectorXd& surface_velocities,
@@ -982,6 +1086,17 @@ void PeridynoBridge::SetFishBoundary(
     cudaMemcpy(p.d_boundary_velocities, cpu_vel.data(), nv * sizeof(float3), cudaMemcpyHostToDevice);
 }
 
+/**
+ * 核心：执行 n_substeps 次 SPH 子步，返回 FEM 顶点上的时间平均流体力
+ *
+ * @param dt  FEM 时间步长 [s]（Environment 中 dt = 1/240 s）
+ * @return    长度 3×N 的 Eigen::VectorXd [N]，单位 [N]，直接作为 FEM 外力
+ *
+ * 后处理顺序：
+ *   1. 子步力求和 → 除以 n_substeps（时间平均）
+ *   2. 若 max_vertex_force>0，按顶点截断力模长
+ *   3. 若 ramp<1，再乘 ramp² 缩放（与子步内 ramp 叠加，需注意）
+ */
 Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
 {
     auto& p = *m_impl;
@@ -1019,7 +1134,7 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
             p.d_boundary_forces_frame, p.num_boundary_vertices);
     }
 
-    // ---- 子步进循环（建议二：时间平均冲量）----
+    // ---- 子步进循环：显式弱耦合 FSI，帧末对边界力做时间平均 ----
     for (int sub = 0; sub < n_substeps; sub++) {
         // 清除本子步的流体力和网格
         clear_forces_kernel<<<gs, bs>>>(p.d_forces, N);
@@ -1082,7 +1197,7 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
                 p.d_boundary_forces_sub, p.d_boundary_forces_frame, nv);
         }
 
-        // 域约束 + 来流 ramp
+        // 来流 ramp：ramp = min(t / T_ramp, 1)，子步内逐步加速流体
         p.current_time += dt_sub;
         float ramp  = fminf(p.current_time / p.flow_ramp_time, 1.0f);
         float3 ramped_flow = make_float3(p.flow_velocity.x * ramp,
@@ -1108,7 +1223,7 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
     p.frame_count++;
     p.last_ramp = fminf(p.current_time / p.flow_ramp_time, 1.0f);
 
-    // ---- 返回时间平均边界力 (建议二) ----
+    // ---- D2H：子步力求平均 → 顶点截断 → ramp² 二次缩放 → 返回给 FEM ----
     Eigen::VectorXd result = Eigen::VectorXd::Zero(3 * p.num_boundary_vertices);
     if (p.num_boundary_vertices > 0 && p.d_boundary_forces_frame) {
         cudaDeviceSynchronize();
