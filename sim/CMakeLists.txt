@@ -133,6 +133,36 @@ target_link_libraries(fsi_stability sim CUDA::cudart ${Boost_LIBRARIES} ${PYTHON
 set_target_properties(fsi_stability PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
+
+# FSI 顶点力快照（5 个时刻导出 + 供 Python 可视化）
+add_executable(fsi_force_snapshot fsi_force_snapshot.test.cpp)
+target_include_directories(fsi_force_snapshot PRIVATE
+    ${PROJECT_SOURCE_DIR}
+    ${EIGEN3_INCLUDE_DIR}
+    ${PYTHON_INCLUDE_DIR}
+    ${Boost_INCLUDE_DIRS}
+)
+target_link_libraries(fsi_force_snapshot sim CUDA::cudart ${Boost_LIBRARIES} ${PYTHON_LIBRARIES})
+set_target_properties(fsi_force_snapshot PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+
+# 无偏位移对比（contact+hydro vs hydro-only）
+add_executable(fsi_unbiased_disp fsi_unbiased_disp.test.cpp)
+target_include_directories(fsi_unbiased_disp PRIVATE
+    ${PROJECT_SOURCE_DIR}
+    ${EIGEN3_INCLUDE_DIR}
+    ${PYTHON_INCLUDE_DIR}
+    ${Boost_INCLUDE_DIRS}
+)
+target_link_libraries(fsi_unbiased_disp sim CUDA::cudart ${Boost_LIBRARIES} ${PYTHON_LIBRARIES})
+set_target_properties(fsi_unbiased_disp PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
 # ============ PeridynoBridge 单元测试 ============
 
 set(WORM_SIM_INCLUDES 

@@ -87,7 +87,7 @@ public:
 private:
 	double CalcPosErr(Eigen::Vector3d p1, Eigen::Vector3d p2);
 	double CalcVelErr(const Eigen::Vector3d v1, const Eigen::Vector3d& v2);
-	void LogVolumeTopologyDiagnostics(double sph_ms, double fem_ms, double step_ms) const;
+	void LogVolumeTopologyDiagnostics(double sph_ms, double fem_ms, double step_ms);
 
 	// const Eigen::VectorXd& GetPos();		// todo: better in Worm?
 	// const Eigen::VectorXd& GetVel();

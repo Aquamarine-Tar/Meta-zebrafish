@@ -25,10 +25,15 @@
 #include <algorithm>
 #include <iostream>
 #include <cstring>
+#include <chrono>
 
-// ===== 编译期开关 =====
-// ENABLE_HYDRO_PRESSURE: 是否启用水压力积分力（1=启用，0=仅接触排斥）
-#define ENABLE_HYDRO_PRESSURE 1
+// ===== 编译期开关（编译时可彻底剔除对应核函数；运行时仍可用 SetEnable* 关闭）=====
+#ifndef ENABLE_CONTACT_REPULSION
+#define ENABLE_CONTACT_REPULSION 1  // 1=编译接触排斥核，0=完全不生成接触力代码
+#endif
+#ifndef ENABLE_HYDRO_PRESSURE
+#define ENABLE_HYDRO_PRESSURE 1       // 1=编译水压力积分核，0=完全不生成水压力代码
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -107,10 +112,13 @@ struct PeridynoBridge::Impl {
     int* d_face_grid_particles = nullptr;  // 存储 face 索引
     bool face_grid_allocated = false;
 
-    // ---- FSI 边界力缓冲 (GPU/CPU) ----
-    float3* d_boundary_forces_sub   = nullptr;  // 单个子步内累积的 FEM 顶点力
-    float3* d_boundary_forces_frame = nullptr;  // 整帧所有子步力之和（帧末再除以 n_substeps）
-    float3* h_boundary_forces_frame = nullptr;  // D2H 后 CPU 侧处理（平均/截断/ramp）
+    // ---- FSI 边界力缓冲 (GPU/CPU)：接触 / 水压力分轨统计 ----
+    float3* d_boundary_forces_contact_sub   = nullptr;
+    float3* d_boundary_forces_hydro_sub     = nullptr;
+    float3* d_boundary_forces_contact_frame = nullptr;
+    float3* d_boundary_forces_hydro_frame   = nullptr;
+    float3* h_boundary_forces_contact_frame = nullptr;
+    float3* h_boundary_forces_hydro_frame   = nullptr;
 
     // ---- 流体 SPH 均匀网格 (GPU, 每子步重建) ----
     int* d_grid_counts    = nullptr;
@@ -341,7 +349,63 @@ __global__ void build_face_grid_kernel(
         grid_particles[cell * MAX_FACES_PER_CELL + slot] = f;
 }
 
-// ==================== 建议一：三角形最近点 + 重心坐标力分配 ====================
+// ==================== 初始化：GPU 并行剔除鱼体内粒子 ====================
+
+/** 与 CPU BuildInitFaceGeometry 相同布局，供初始化过滤核使用 */
+struct InitFaceGeometry {
+    float3 A, B, C, n;
+};
+
+__host__ __device__ void closest_point_on_triangle(
+    const float3& A, const float3& B, const float3& C,
+    const float3& P,
+    float3& Q, float& u, float& v, float& w);
+
+/**
+ * 每个线程处理一个候选粒子：对全部三角面求最近点，与接触排斥同判据
+ *   outside_signed = dot(P - Q, n)
+ *   keep = (outside AABB) || (outside_signed > 0)
+ */
+__global__ void filter_init_particles_outside_fish_kernel(
+    const float3* __restrict__ positions,
+    int num_particles,
+    const InitFaceGeometry* __restrict__ faces,
+    int num_faces,
+    float bb_xmin, float bb_ymin, float bb_zmin,
+    float bb_xmax, float bb_ymax, float bb_zmax,
+    unsigned char* __restrict__ keep)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_particles) return;
+
+    const float3 P = positions[i];
+    if (P.x < bb_xmin || P.x > bb_xmax ||
+        P.y < bb_ymin || P.y > bb_ymax ||
+        P.z < bb_zmin || P.z > bb_zmax) {
+        keep[i] = 1;
+        return;
+    }
+
+    float best_dist2 = 1e30f;
+    float best_outside_signed = 1.0f;
+    for (int f = 0; f < num_faces; ++f) {
+        const InitFaceGeometry face = faces[f];
+        float3 Q;
+        float u, v, w;
+        closest_point_on_triangle(face.A, face.B, face.C, P, Q, u, v, w);
+
+        const float3 r_vec = P - Q;
+        const float dist2 = dot(r_vec, r_vec);
+        const float outside_signed = dot(r_vec, face.n);
+        if (dist2 < best_dist2) {
+            best_dist2 = dist2;
+            best_outside_signed = outside_signed;
+        }
+    }
+    keep[i] = (best_outside_signed > 0.0f) ? 1 : 0;
+}
+
+// ==================== 三角形最近点 + 重心坐标（接触排斥 / 初始化共用）====================
 
 /**
  * 计算点 P 到三角形 ABC 的最近点 Q 及重心坐标 (u,v,w)
@@ -349,7 +413,7 @@ __global__ void build_face_grid_kernel(
  * 算法：Möller, "Fast Minimum Distance Between a Point and a Triangle"
  * 用途：将接触力按 (u,v,w) 分配到三个 FEM 顶点
  */
-__device__ void closest_point_on_triangle(
+__host__ __device__ void closest_point_on_triangle(
     const float3& A, const float3& B, const float3& C,
     const float3& P,
     float3& Q, float& u, float& v, float& w)
@@ -762,7 +826,8 @@ PeridynoBridge::~PeridynoBridge() { Destroy(); delete m_impl; }
  * @param viscosity          人工粘性 μ（默认 0.01）
  * @param sound_speed        Tait EOS 声速 c_s [m/s]（默认 20）
  * @param boundary_thickness 预留参数（当前未直接使用）
- * @param exclusion_*        鱼体 AABB 排除区，避免流体粒子初始嵌入鱼体
+ * @param surface_vertices   鱼体 FEM 顶点（用于初始化时剔除体内粒子）
+ * @param surface_faces      鱼体表面三角面（与 SetFishBoundary / 接触排斥一致）
  */
 void PeridynoBridge::Initialize(
     const Eigen::Vector3d& domain_min, const Eigen::Vector3d& domain_max,
@@ -770,10 +835,8 @@ void PeridynoBridge::Initialize(
     const Eigen::Vector3d& flow_velocity,
     float rest_density, float viscosity,
     float sound_speed, float boundary_thickness,
-    const Eigen::Vector3d& exclusion_min,
-    const Eigen::Vector3d& exclusion_max,
-    float exclusion_margin,
-    bool use_exclusion)
+    const Eigen::VectorXd& surface_vertices,
+    const std::vector<Eigen::Vector3i>& surface_faces)
 {
     if (m_impl->initialized) Destroy();
 
@@ -782,10 +845,8 @@ void PeridynoBridge::Initialize(
     m_flow_velocity = flow_velocity;
     m_rest_density = rest_density; m_viscosity = viscosity;
     m_sound_speed = sound_speed; m_boundary_thickness = boundary_thickness;
-    m_exclusion_min = exclusion_min;
-    m_exclusion_max = exclusion_max;
-    m_exclusion_margin = exclusion_margin;
-    m_use_exclusion = use_exclusion;
+    m_init_surface_vertices = surface_vertices;
+    m_init_surface_faces = surface_faces;
 
     auto& p = *m_impl;
     p.domain_min = domain_min; p.domain_max = domain_max;
@@ -842,7 +903,101 @@ void PeridynoBridge::Initialize(
               << std::endl;
 }
 
-/** 在规则网格上生成流体粒子，跳过鱼体 exclusion AABB 内的格点 */
+namespace {
+
+/** 预计算所有表面三角形的顶点与 outward 法向（与 update_face_data_kernel 一致） */
+std::vector<InitFaceGeometry> BuildInitFaceGeometry(
+    const Eigen::VectorXd& vertices,
+    const std::vector<Eigen::Vector3i>& faces)
+{
+    std::vector<InitFaceGeometry> geom;
+    geom.reserve(faces.size());
+    for (const Eigen::Vector3i& fi : faces) {
+        InitFaceGeometry g;
+        g.A = make_float3(
+            (float)vertices(3 * fi[0]), (float)vertices(3 * fi[0] + 1), (float)vertices(3 * fi[0] + 2));
+        g.B = make_float3(
+            (float)vertices(3 * fi[1]), (float)vertices(3 * fi[1] + 1), (float)vertices(3 * fi[1] + 2));
+        g.C = make_float3(
+            (float)vertices(3 * fi[2]), (float)vertices(3 * fi[2] + 1), (float)vertices(3 * fi[2] + 2));
+        const float3 e0 = g.B - g.A;
+        const float3 e1 = g.C - g.A;
+        g.n = normalize(make_float3(
+            e0.y * e1.z - e0.z * e1.y,
+            e0.z * e1.x - e0.x * e1.z,
+            e0.x * e1.y - e0.y * e1.x));
+        geom.push_back(g);
+    }
+    return geom;
+}
+
+/** GPU 并行过滤：复用 closest_point_on_triangle + dot(P-Q,n)>0，CPU 侧 compact */
+int FilterParticlesOutsideFishGPU(
+    std::vector<float3>& particles,
+    const std::vector<InitFaceGeometry>& faces,
+    float bb_xmin, float bb_ymin, float bb_zmin,
+    float bb_xmax, float bb_ymax, float bb_zmax)
+{
+    const int n = (int)particles.size();
+    if (n == 0 || faces.empty()) return 0;
+
+    InitFaceGeometry* d_faces = nullptr;
+    float3* d_pos = nullptr;
+    unsigned char* d_keep = nullptr;
+    cudaMalloc(&d_faces, faces.size() * sizeof(InitFaceGeometry));
+    cudaMalloc(&d_pos, n * sizeof(float3));
+    cudaMalloc(&d_keep, n * sizeof(unsigned char));
+    cudaMemcpy(d_faces, faces.data(), faces.size() * sizeof(InitFaceGeometry), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_pos, particles.data(), n * sizeof(float3), cudaMemcpyHostToDevice);
+
+    const int bs = 256;
+    const int gs = (n + bs - 1) / bs;
+    filter_init_particles_outside_fish_kernel<<<gs, bs>>>(
+        d_pos, n, d_faces, (int)faces.size(),
+        bb_xmin, bb_ymin, bb_zmin, bb_xmax, bb_ymax, bb_zmax,
+        d_keep);
+    cudaDeviceSynchronize();
+
+    std::vector<unsigned char> keep(n, 0);
+    cudaMemcpy(keep.data(), d_keep, n * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+
+    int idx = 0;
+    int skipped = 0;
+    for (int i = 0; i < n; ++i) {
+        if (keep[i])
+            particles[idx++] = particles[i];
+        else
+            skipped++;
+    }
+    particles.resize(idx);
+
+    cudaFree(d_faces);
+    cudaFree(d_pos);
+    cudaFree(d_keep);
+    return skipped;
+}
+
+void ComputeMeshAABB(
+    const Eigen::VectorXd& vertices,
+    float& xmin, float& ymin, float& zmin,
+    float& xmax, float& ymax, float& zmax)
+{
+    const int n = vertices.size() / 3;
+    xmin = ymin = zmin = 1e30f;
+    xmax = ymax = zmax = -1e30f;
+    for (int i = 0; i < n; ++i) {
+        const float x = (float)vertices(3 * i);
+        const float y = (float)vertices(3 * i + 1);
+        const float z = (float)vertices(3 * i + 2);
+        xmin = fminf(xmin, x); xmax = fmaxf(xmax, x);
+        ymin = fminf(ymin, y); ymax = fmaxf(ymax, y);
+        zmin = fminf(zmin, z); zmax = fmaxf(zmax, z);
+    }
+}
+
+}  // namespace
+
+/** 在规则网格上生成流体粒子；若提供鱼体表面 mesh，剔除体内粒子（与接触排斥同判据） */
 void PeridynoBridge::InitFluidParticles()
 {
     auto& p = *m_impl;
@@ -854,36 +1009,42 @@ void PeridynoBridge::InitFluidParticles()
     p.num_particles = nx * ny * nz;
 
     std::vector<float3> cpu_pos(p.num_particles);
-    float excl_xmin = (float)m_exclusion_min.x() - m_exclusion_margin;
-    float excl_xmax = (float)m_exclusion_max.x() + m_exclusion_margin;
-    float excl_ymin = (float)m_exclusion_min.y() - m_exclusion_margin;
-    float excl_ymax = (float)m_exclusion_max.y() + m_exclusion_margin;
-    float excl_zmin = (float)m_exclusion_min.z() - m_exclusion_margin;
-    float excl_zmax = (float)m_exclusion_max.z() + m_exclusion_margin;
-    int idx = 0, skipped = 0;
+    const bool filter_inside_fish = !m_init_surface_faces.empty();
+    std::vector<InitFaceGeometry> init_faces;
+    float bb_xmin = 0, bb_ymin = 0, bb_zmin = 0, bb_xmax = 0, bb_ymax = 0, bb_zmax = 0;
+    if (filter_inside_fish) {
+        init_faces = BuildInitFaceGeometry(m_init_surface_vertices, m_init_surface_faces);
+        ComputeMeshAABB(m_init_surface_vertices, bb_xmin, bb_ymin, bb_zmin, bb_xmax, bb_ymax, bb_zmax);
+    }
+
+    int idx = 0;
     for (int iz = 0; iz < nz; iz++)
         for (int iy = 0; iy < ny; iy++)
             for (int ix = 0; ix < nx; ix++) {
                 float x = (float)p.domain_min.x() + ix * sp + sp * 0.5f;
                 float y = (float)p.domain_min.y() + iy * sp + sp * 0.5f;
                 float z = (float)p.domain_min.z() + iz * sp + sp * 0.5f;
-                if (m_use_exclusion &&
-                    x > excl_xmin && x < excl_xmax &&
-                    y > excl_ymin && y < excl_ymax &&
-                    z > excl_zmin && z < excl_zmax) {
-                    skipped++;
-                    continue;
-                }
-                cpu_pos[idx++] = {x + 0.0001f * (rand() % 100 - 50),
-                                  y + 0.0001f * (rand() % 100 - 50),
-                                  z + 0.0001f * (rand() % 100 - 50)};
+                x += 0.0001f * (rand() % 100 - 50);
+                y += 0.0001f * (rand() % 100 - 50);
+                z += 0.0001f * (rand() % 100 - 50);
+                cpu_pos[idx++] = {x, y, z};
             }
-    p.num_particles = idx;
-    if (skipped > 0)
-        printf("[PeridynoBridge] Excluded %d particles inside exclusion AABB "
-               "[%.3f,%.3f,%.3f]-[%.3f,%.3f,%.3f] margin=%.3f\n",
-               skipped, excl_xmin, excl_ymin, excl_zmin,
-               excl_xmax, excl_ymax, excl_zmax, m_exclusion_margin);
+
+    int skipped = 0;
+    if (filter_inside_fish) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        skipped = FilterParticlesOutsideFishGPU(
+            cpu_pos, init_faces,
+            bb_xmin, bb_ymin, bb_zmin, bb_xmax, bb_ymax, bb_zmax);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        const double filter_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (skipped > 0) {
+            printf("[PeridynoBridge] GPU excluded %d particles inside fish surface mesh "
+                   "(%zu triangles, dot(P-Q,n)>0, %.1f ms)\n",
+                   skipped, m_init_surface_faces.size(), filter_ms);
+        }
+    }
+    p.num_particles = (int)cpu_pos.size();
 
     cudaMalloc(&p.d_positions, p.num_particles * sizeof(float3));
     cudaMalloc(&p.d_velocities, p.num_particles * sizeof(float3));
@@ -934,13 +1095,42 @@ void PeridynoBridge::SetMaxVertexForce(float max_force)
     if (m_impl) m_impl->max_vertex_force = m_max_vertex_force;
 }
 
+void PeridynoBridge::SetEnableContactRepulsion(bool enable)
+{
+    m_enable_contact_repulsion = enable;
+}
+
+void PeridynoBridge::SetEnableHydroPressure(bool enable)
+{
+    m_enable_hydro_pressure = enable;
+}
+
+FsiForceDiagnostics PeridynoBridge::ConsumeSecondFsiForceDiagnostics()
+{
+    FsiForceDiagnostics d;
+    if (m_roll_frame_count > 0) {
+        const double inv = 1.0 / static_cast<double>(m_roll_frame_count);
+        d.contact_total_avg_n = m_roll_sum_contact_total * inv;
+        d.hydro_total_avg_n   = m_roll_sum_hydro_total * inv;
+        d.contact_peak_n      = m_roll_peak_contact;
+        d.hydro_peak_n        = m_roll_peak_hydro;
+        d.frames              = m_roll_frame_count;
+    }
+    m_roll_sum_contact_total = 0.0;
+    m_roll_sum_hydro_total   = 0.0;
+    m_roll_peak_contact      = 0.0;
+    m_roll_peak_hydro        = 0.0;
+    m_roll_frame_count       = 0;
+    return d;
+}
+
 void PeridynoBridge::Reset()
 {
     if (!m_impl->initialized) return;
     Destroy();
     Initialize(m_domain_min, m_domain_max, m_particle_spacing, m_flow_velocity,
                m_rest_density, m_viscosity, m_sound_speed, m_boundary_thickness,
-               m_exclusion_min, m_exclusion_max, m_exclusion_margin, m_use_exclusion);
+               m_init_surface_vertices, m_init_surface_faces);
 }
 
 float PeridynoBridge::GetFlowRampFactor() const
@@ -958,8 +1148,10 @@ void PeridynoBridge::Destroy()
 
     CUDA_SAFE_FREE(p.d_boundary_vertices);
     CUDA_SAFE_FREE(p.d_boundary_velocities);
-    CUDA_SAFE_FREE(p.d_boundary_forces_sub);
-    CUDA_SAFE_FREE(p.d_boundary_forces_frame);
+    CUDA_SAFE_FREE(p.d_boundary_forces_contact_sub);
+    CUDA_SAFE_FREE(p.d_boundary_forces_hydro_sub);
+    CUDA_SAFE_FREE(p.d_boundary_forces_contact_frame);
+    CUDA_SAFE_FREE(p.d_boundary_forces_hydro_frame);
 
     CUDA_SAFE_FREE(p.d_face_indices);
     CUDA_SAFE_FREE(p.d_face_centers);
@@ -971,7 +1163,8 @@ void PeridynoBridge::Destroy()
     CUDA_SAFE_FREE(p.d_grid_counts); CUDA_SAFE_FREE(p.d_grid_cell_start);
     CUDA_SAFE_FREE(p.d_grid_cell_end); CUDA_SAFE_FREE(p.d_grid_particles);
 
-    free(p.h_boundary_forces_frame); p.h_boundary_forces_frame = nullptr;
+    free(p.h_boundary_forces_contact_frame); p.h_boundary_forces_contact_frame = nullptr;
+    free(p.h_boundary_forces_hydro_frame);     p.h_boundary_forces_hydro_frame = nullptr;
 
     p.num_particles = 0;
     p.num_boundary_vertices = 0;
@@ -979,6 +1172,11 @@ void PeridynoBridge::Destroy()
     p.face_grid_allocated = false;
     p.initialized = false;
     m_initialized = false;
+    m_roll_sum_contact_total = 0.0;
+    m_roll_sum_hydro_total   = 0.0;
+    m_roll_peak_contact      = 0.0;
+    m_roll_peak_hydro        = 0.0;
+    m_roll_frame_count       = 0;
 }
 
 /**
@@ -1008,16 +1206,22 @@ void PeridynoBridge::SetFishBoundary(
     if (vertices_changed) {
         CUDA_SAFE_FREE(p.d_boundary_vertices);
         CUDA_SAFE_FREE(p.d_boundary_velocities);
-        CUDA_SAFE_FREE(p.d_boundary_forces_sub);
-        CUDA_SAFE_FREE(p.d_boundary_forces_frame);
-        free(p.h_boundary_forces_frame); p.h_boundary_forces_frame = nullptr;
+        CUDA_SAFE_FREE(p.d_boundary_forces_contact_sub);
+        CUDA_SAFE_FREE(p.d_boundary_forces_hydro_sub);
+        CUDA_SAFE_FREE(p.d_boundary_forces_contact_frame);
+        CUDA_SAFE_FREE(p.d_boundary_forces_hydro_frame);
+        free(p.h_boundary_forces_contact_frame); p.h_boundary_forces_contact_frame = nullptr;
+        free(p.h_boundary_forces_hydro_frame);     p.h_boundary_forces_hydro_frame = nullptr;
 
         p.num_boundary_vertices = nv;
         cudaMalloc(&p.d_boundary_vertices,   nv * sizeof(float3));
         cudaMalloc(&p.d_boundary_velocities, nv * sizeof(float3));
-        cudaMalloc(&p.d_boundary_forces_sub,   nv * sizeof(float3));
-        cudaMalloc(&p.d_boundary_forces_frame, nv * sizeof(float3));
-        p.h_boundary_forces_frame = (float3*)malloc(nv * sizeof(float3));
+        cudaMalloc(&p.d_boundary_forces_contact_sub,   nv * sizeof(float3));
+        cudaMalloc(&p.d_boundary_forces_hydro_sub,     nv * sizeof(float3));
+        cudaMalloc(&p.d_boundary_forces_contact_frame, nv * sizeof(float3));
+        cudaMalloc(&p.d_boundary_forces_hydro_frame,   nv * sizeof(float3));
+        p.h_boundary_forces_contact_frame = (float3*)malloc(nv * sizeof(float3));
+        p.h_boundary_forces_hydro_frame   = (float3*)malloc(nv * sizeof(float3));
 
         std::cout << "[PeridynoBridge] Boundary: " << nv << " vertices" << std::endl;
     }
@@ -1084,6 +1288,8 @@ void PeridynoBridge::SetFishBoundary(
     }
     cudaMemcpy(p.d_boundary_vertices,   cpu_v.data(),   nv * sizeof(float3), cudaMemcpyHostToDevice);
     cudaMemcpy(p.d_boundary_velocities, cpu_vel.data(), nv * sizeof(float3), cudaMemcpyHostToDevice);
+
+    m_last_fsi_snapshot.positions = surface_vertices;
 }
 
 /**
@@ -1128,10 +1334,13 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
             p.face_grid_params, p.num_faces);
     }
 
-    // ---- 清零帧累积力 ----
+    // ---- 清零帧累积力（接触 / 水压力分轨）----
     if (p.num_boundary_vertices > 0) {
-        clear_forces_kernel<<<(p.num_boundary_vertices + bs - 1) / bs, bs>>>(
-            p.d_boundary_forces_frame, p.num_boundary_vertices);
+        int nv_clear = p.num_boundary_vertices;
+        clear_forces_kernel<<<(nv_clear + bs - 1) / bs, bs>>>(
+            p.d_boundary_forces_contact_frame, nv_clear);
+        clear_forces_kernel<<<(nv_clear + bs - 1) / bs, bs>>>(
+            p.d_boundary_forces_hydro_frame, nv_clear);
     }
 
     // ---- 子步进循环：显式弱耦合 FSI，帧末对边界力做时间平均 ----
@@ -1160,41 +1369,46 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
         if (p.num_boundary_vertices > 0 && p.num_faces > 0 && p.face_grid_allocated) {
             int nv = p.num_boundary_vertices;
 
-            // 清除本子步边界力
+            // 清除本子步边界力（分轨）
             clear_forces_kernel<<<(nv + bs - 1) / bs, bs>>>(
-                p.d_boundary_forces_sub, nv);
+                p.d_boundary_forces_contact_sub, nv);
+            clear_forces_kernel<<<(nv + bs - 1) / bs, bs>>>(
+                p.d_boundary_forces_hydro_sub, nv);
 
-            // 非穿透接触排斥力（建议一 + 建议六前半）
-            // 面网格已在帧首构建，不重复构建
-            compute_triangle_repulsion_kernel<<<gs, bs>>>(
-                p.d_positions, p.d_velocities,
-                p.d_forces,
-                p.d_boundary_vertices, p.d_boundary_velocities,
-                p.d_face_indices, p.d_face_normals,
-                p.d_boundary_forces_sub,
-                p.d_face_grid_particles, p.face_grid_params,
-                p.particle_spacing,   // repulsion_h = particle_spacing
-                p.contact_stiffness,
-                p.contact_damping,
-                p.num_faces, N);
-
-#if ENABLE_HYDRO_PRESSURE
-            // 流体压力积分力（建议六后半）
-            // 使用当前子步的流体网格和压力
-            compute_hydro_pressure_kernel<<<(p.num_faces + bs - 1) / bs, bs>>>(
-                p.d_positions, p.d_pressures,
-                p.d_forces,
-                p.d_boundary_vertices,
-                p.d_face_indices, p.d_face_centers, p.d_face_normals, p.d_face_areas,
-                p.d_boundary_forces_sub,
-                p.d_grid_particles, p.grid_params,
-                p.h, p.rest_density, p.hydro_force_scale,
-                p.num_faces, N);
+#if ENABLE_CONTACT_REPULSION
+            if (m_enable_contact_repulsion) {
+                compute_triangle_repulsion_kernel<<<gs, bs>>>(
+                    p.d_positions, p.d_velocities,
+                    p.d_forces,
+                    p.d_boundary_vertices, p.d_boundary_velocities,
+                    p.d_face_indices, p.d_face_normals,
+                    p.d_boundary_forces_contact_sub,
+                    p.d_face_grid_particles, p.face_grid_params,
+                    p.particle_spacing*1.5f,
+                    p.contact_stiffness,
+                    p.contact_damping,
+                    p.num_faces, N);
+            }
 #endif
 
-            // 累积到帧级力缓冲区
+#if ENABLE_HYDRO_PRESSURE
+            if (m_enable_hydro_pressure) {
+                compute_hydro_pressure_kernel<<<(p.num_faces + bs - 1) / bs, bs>>>(
+                    p.d_positions, p.d_pressures,
+                    p.d_forces,
+                    p.d_boundary_vertices,
+                    p.d_face_indices, p.d_face_centers, p.d_face_normals, p.d_face_areas,
+                    p.d_boundary_forces_hydro_sub,
+                    p.d_grid_particles, p.grid_params,
+                    p.h, p.rest_density, p.hydro_force_scale,
+                    p.num_faces, N);
+            }
+#endif
+
             accumulate_forces_kernel<<<(nv + bs - 1) / bs, bs>>>(
-                p.d_boundary_forces_sub, p.d_boundary_forces_frame, nv);
+                p.d_boundary_forces_contact_sub, p.d_boundary_forces_contact_frame, nv);
+            accumulate_forces_kernel<<<(nv + bs - 1) / bs, bs>>>(
+                p.d_boundary_forces_hydro_sub, p.d_boundary_forces_hydro_frame, nv);
         }
 
         // 来流 ramp：ramp = min(t / T_ramp, 1)，子步内逐步加速流体
@@ -1223,61 +1437,92 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
     p.frame_count++;
     p.last_ramp = fminf(p.current_time / p.flow_ramp_time, 1.0f);
 
-    // ---- D2H：子步力求平均 → 顶点截断 → ramp² 二次缩放 → 返回给 FEM ----
+    // ---- D2H：分轨时间平均 → 合并 → 顶点截断 → ramp² → 返回 FEM ----
     Eigen::VectorXd result = Eigen::VectorXd::Zero(3 * p.num_boundary_vertices);
-    if (p.num_boundary_vertices > 0 && p.d_boundary_forces_frame) {
+    if (p.num_boundary_vertices > 0 &&
+        p.d_boundary_forces_contact_frame && p.d_boundary_forces_hydro_frame) {
         cudaDeviceSynchronize();
-        cudaMemcpy(p.h_boundary_forces_frame, p.d_boundary_forces_frame,
+        cudaMemcpy(p.h_boundary_forces_contact_frame, p.d_boundary_forces_contact_frame,
+                   p.num_boundary_vertices * sizeof(float3), cudaMemcpyDeviceToHost);
+        cudaMemcpy(p.h_boundary_forces_hydro_frame, p.d_boundary_forces_hydro_frame,
                    p.num_boundary_vertices * sizeof(float3), cudaMemcpyDeviceToHost);
 
-        float avg_scale = 1.0f / (float)n_substeps;
-        float total_force_mag = 0.0f;
-        float max_force = 0.0f;
-        float max_force_u = 0.0f;  // 未平均的最大力（用于诊断）
+        const float avg_scale = 1.0f / static_cast<float>(n_substeps);
+        const float force_scale = p.last_ramp * p.last_ramp;
+
+        const int nv = p.num_boundary_vertices;
+        m_last_fsi_snapshot.contact.resize(3 * nv);
+        m_last_fsi_snapshot.hydro.resize(3 * nv);
+        m_last_fsi_snapshot.total.resize(3 * nv);
+        m_last_fsi_snapshot.flow_ramp = p.last_ramp;
+        m_last_fsi_snapshot.valid = true;
+
+        float frame_contact_total = 0.0f;
+        float frame_hydro_total   = 0.0f;
+        float frame_contact_peak  = 0.0f;
+        float frame_hydro_peak    = 0.0f;
+        float total_force_mag     = 0.0f;
+        float max_force           = 0.0f;
 
         for (int i = 0; i < p.num_boundary_vertices; i++) {
-            float fx = p.h_boundary_forces_frame[i].x;
-            float fy = p.h_boundary_forces_frame[i].y;
-            float fz = p.h_boundary_forces_frame[i].z;
+            float cx = p.h_boundary_forces_contact_frame[i].x * avg_scale * force_scale;
+            float cy = p.h_boundary_forces_contact_frame[i].y * avg_scale * force_scale;
+            float cz = p.h_boundary_forces_contact_frame[i].z * avg_scale * force_scale;
+            float hx = p.h_boundary_forces_hydro_frame[i].x * avg_scale * force_scale;
+            float hy = p.h_boundary_forces_hydro_frame[i].y * avg_scale * force_scale;
+            float hz = p.h_boundary_forces_hydro_frame[i].z * avg_scale * force_scale;
 
-            float fm_raw = sqrtf(fx * fx + fy * fy + fz * fz);
-            if (fm_raw > max_force_u) max_force_u = fm_raw;
+            const float contact_mag = sqrtf(cx * cx + cy * cy + cz * cz);
+            const float hydro_mag   = sqrtf(hx * hx + hy * hy + hz * hz);
+            frame_contact_total += contact_mag;
+            frame_hydro_total   += hydro_mag;
+            if (contact_mag > frame_contact_peak) frame_contact_peak = contact_mag;
+            if (hydro_mag > frame_hydro_peak)     frame_hydro_peak = hydro_mag;
 
-            // 时间平均
-            fx *= avg_scale;
-            fy *= avg_scale;
-            fz *= avg_scale;
+            float fx = cx + hx;
+            float fy = cy + hy;
+            float fz = cz + hz;
 
             if (p.max_vertex_force > 0.0f) {
-                float fm_avg = sqrtf(fx * fx + fy * fy + fz * fz);
-                if (fm_avg > p.max_vertex_force) {
-                    float clip = p.max_vertex_force / fmaxf(fm_avg, 1e-12f);
+                const float fm = sqrtf(fx * fx + fy * fy + fz * fz);
+                if (fm > p.max_vertex_force) {
+                    const float clip = p.max_vertex_force / fmaxf(fm, 1e-12f);
                     fx *= clip;
                     fy *= clip;
                     fz *= clip;
                 }
             }
 
-            result(3*i)   = fx;
-            result(3*i+1) = fy;
-            result(3*i+2) = fz;
+            result(3 * i)     = fx;
+            result(3 * i + 1) = fy;
+            result(3 * i + 2) = fz;
 
-            float fm = sqrtf(fx * fx + fy * fy + fz * fz);
+            m_last_fsi_snapshot.contact(3 * i)     = cx;
+            m_last_fsi_snapshot.contact(3 * i + 1) = cy;
+            m_last_fsi_snapshot.contact(3 * i + 2) = cz;
+            m_last_fsi_snapshot.hydro(3 * i)       = hx;
+            m_last_fsi_snapshot.hydro(3 * i + 1)   = hy;
+            m_last_fsi_snapshot.hydro(3 * i + 2)   = hz;
+            m_last_fsi_snapshot.total(3 * i)       = fx;
+            m_last_fsi_snapshot.total(3 * i + 1)   = fy;
+            m_last_fsi_snapshot.total(3 * i + 2)   = fz;
+
+            const float fm = sqrtf(fx * fx + fy * fy + fz * fz);
             total_force_mag += fm;
             if (fm > max_force) max_force = fm;
         }
 
-        // 来流 ramp 缩放水动力
-        float flow_ramp = p.last_ramp;
-        float force_scale = flow_ramp * flow_ramp;
-        if (force_scale < 1.0f)
-            result *= force_scale;
+        m_roll_sum_contact_total += frame_contact_total;
+        m_roll_sum_hydro_total   += frame_hydro_total;
+        if (frame_contact_peak > m_roll_peak_contact) m_roll_peak_contact = frame_contact_peak;
+        if (frame_hydro_peak > m_roll_peak_hydro)     m_roll_peak_hydro = frame_hydro_peak;
+        ++m_roll_frame_count;
 
         if (p.frame_count % 100 == 1) {
-            float ramp  = p.last_ramp;
-            float3 rflow = make_float3(p.flow_velocity.x * ramp,
-                                       p.flow_velocity.y * ramp,
-                                       p.flow_velocity.z * ramp);
+            const float ramp = p.last_ramp;
+            const float3 rflow = make_float3(p.flow_velocity.x * ramp,
+                                             p.flow_velocity.y * ramp,
+                                             p.flow_velocity.z * ramp);
             printf("[SPH t=%.2f ramp=%.2f flow_z=%.3f frame=%d sub=%d] "
                    "contact(h=%.3f k=%.0f) hydro force=%.1f N max_vtx=%.4f N\n",
                    p.current_time, ramp, rflow.z, p.frame_count, n_substeps,

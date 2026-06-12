@@ -62,7 +62,7 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
     // 流体域约为原尺寸的 2 倍，以鱼体 AABB 中心为域中心
     mFluidBridge = new PeridynoBridge();
     float particle_spacing = 0.01f;  // 1cm 分辨率，鱼体横向约 13 个粒子
-    Eigen::Vector3d flow_velocity(0, 0, -0.05);
+    Eigen::Vector3d flow_velocity(0, 0, 0);  // 流速
     Eigen::Vector3d fish_min = mCreature->GetMeshBBMin();
     Eigen::Vector3d fish_max = mCreature->GetMeshBBMax();
     const Eigen::Vector3d fish_center = 0.5 * (fish_min + fish_max);
@@ -70,22 +70,21 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
     const Eigen::Vector3d domain_half(0.4, 0.3, 0.65);
     const Eigen::Vector3d fluid_min = fish_center - domain_half;
     const Eigen::Vector3d fluid_max = fish_center + domain_half;
-    float exclusion_margin = particle_spacing;
     mFluidBridge->Initialize(fluid_min, fluid_max, particle_spacing,
                              flow_velocity,
                              1000.0f,
                              0.01f,
                              20.0f,
                              0.05f,
-                             fish_min, fish_max,
-                             exclusion_margin,
-                             true);
+                             mSoftWorld->GetPositions(),
+                             mCreature->GetContours());
     // FSI 稳定性调参（fsi_stability 5s 验证: vol≈0.96, inverted≤8）
     mFluidBridge->SetSubsteps(24);
-    mFluidBridge->SetContactParams(0.3f, 25.0f);
+    mFluidBridge->SetContactParams(0.3f, 15.0f);
     mFluidBridge->SetFlowRampTime(12.0f);
-    mFluidBridge->SetHydroForceScale(0.035f);  // 渐进恢复水压力积分（细扫: vol≈0.96, inverted=13）
+    mFluidBridge->SetHydroForceScale(1.0f);  // 渐进恢复水压力积分（细扫: vol≈0.96, inverted=13）
     mFluidBridge->SetMaxVertexForce(3.0f);    // 顶点力上限 (N)
+    mFluidBridge->SetEnableContactRepulsion(false);  // 关闭接触斥力
     std::cout << "[Environment] GPU SPH solver initialized." << std::endl;
     std::cout << "[Environment] Fluid domain (fish-centered): "
               << fluid_min.transpose() << " to " << fluid_max.transpose()
@@ -203,11 +202,12 @@ void Environment::Step()
         LogVolumeTopologyDiagnostics(sph_ms, fem_ms, step_ms);
 }
 
-void Environment::LogVolumeTopologyDiagnostics(double sph_ms, double fem_ms, double step_ms) const
+void Environment::LogVolumeTopologyDiagnostics(double sph_ms, double fem_ms, double step_ms)
 {
     const Eigen::VectorXd& x = mSoftWorld->GetPositions();
     VolumeStats stats = mCreature->ComputeVolumeStats(x);
     const double sim_time = mCurrIters / static_cast<double>(mSimulationHz);
+    const FsiForceDiagnostics fsi = mFluidBridge->ConsumeSecondFsiForceDiagnostics();
 
     const char* level = "INFO";
     if (stats.inverted_tets > 0)
@@ -217,11 +217,15 @@ void Environment::LogVolumeTopologyDiagnostics(double sph_ms, double fem_ms, dou
         level = "WARN";
 
     printf("[%s] [%s FEM t=%.4fs iter=%d sph_ms=%.2f fem_ms=%.2f step_ms=%.2f] "
-           "volume_ratio=%.6f tet_ratio=[%.4f, %.4f] inverted=%d total_vol=%.6e m^3\n",
+           "volume_ratio=%.6f tet_ratio=[%.4f, %.4f] inverted=%d total_vol=%.6e m^3 | "
+           "FSI(1s n=%d): contact_avg=%.2f N peak=%.4f N, hydro_avg=%.2f N peak=%.4f N\n",
            WallClockTimestamp().c_str(), level, sim_time, mCurrIters,
            sph_ms, fem_ms, step_ms,
            stats.volume_ratio, stats.min_tet_ratio, stats.max_tet_ratio,
-           stats.inverted_tets, stats.total_volume);
+           stats.inverted_tets, stats.total_volume,
+           fsi.frames,
+           fsi.contact_total_avg_n, fsi.contact_peak_n,
+           fsi.hydro_total_avg_n, fsi.hydro_peak_n);
 }
 
 void Environment::SetPhase(const unsigned int& phase)

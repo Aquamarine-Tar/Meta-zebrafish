@@ -1,4 +1,6 @@
 #include "World.h"
+#include <chrono>
+#include <omp.h>        
 #define EPS 1E-9
 using namespace FEM;
 
@@ -73,6 +75,7 @@ void World::Initialize()
 
 	std::cout << "Total degree of freedom : " << mX.rows() << std::endl;
 	std::cout << "Total constraints : " << mConstraints.size() << std::endl;
+	std::cout << "OpenMP max threads: " << omp_get_max_threads() << std::endl;  
 }
 
 void World::Reset()
@@ -185,13 +188,24 @@ Eigen::VectorXd World::ProjectiveDynamicsMethod()
 	x_n1 =mQn;
 
 	int i;
+	double total_eval_ms = 0, total_solve_ms = 0;
 	for(i=0; i<mMaxIteration; i++) {
+		auto t_eval0 = std::chrono::high_resolution_clock::now();
 		EvaluateDVector(x_n1,d);
+		auto t_eval1 = std::chrono::high_resolution_clock::now();
+		auto t_solve0 = std::chrono::high_resolution_clock::now();
 		x_n1_new = mDynamicSolver.solve(b+mJ*d);
+		auto t_solve1 = std::chrono::high_resolution_clock::now();
+		total_eval_ms += std::chrono::duration<double,std::milli>(t_eval1-t_eval0).count();
+		total_solve_ms += std::chrono::duration<double,std::milli>(t_solve1-t_solve0).count();
 		if((x_n1_new - x_n1).norm()/x_n1.size() < EPS) {
 			break;
 		} 
 		x_n1 = x_n1_new;
+	}
+	if (mFrame % 60 == 0) {
+		std::cout << "[FEM] PD iter=" << (i+1) << " eval_ms=" << total_eval_ms
+		          << " solve_ms=" << total_solve_ms << std::endl;
 	}
 	return x_n1;
 }
@@ -232,17 +246,23 @@ void World::EvaluateLMatrix(Eigen::SparseMatrix<double>& L)
 
 void World::EvaluateDVector(const Eigen::VectorXd& x,Eigen::VectorXd& d) 
 {
-	d.resize(mConstraintDofs*3);
 	int n = mConstraints.size();
-// #pragma omp parallel for
+	d.resize(mConstraintDofs*3);
+	// 阶段1：并行计算每个约束的 md/mp0（只读 x，写各约束成员变量）
+	#pragma omp parallel for
 	for(int i=0;i<n;i++)
 	{
 		mConstraints[i]->EvaluateDVector(x);
 	}
-	int index = 0;
-	for(auto& c : mConstraints)
+	// 阶段2：并行写入 d 向量，预计算偏移量避免共享 index 竞争
+	std::vector<int> offsets(n + 1, 0);
+	for (int i = 0; i < n; ++i)
+		offsets[i + 1] = offsets[i] + mConstraints[i]->GetDof();
+	#pragma omp parallel for
+	for (int i = 0; i < n; ++i)
 	{
-		c->GetDVector(index,d);
+		int idx = offsets[i];
+		mConstraints[i]->GetDVector(idx, d);
 	}
 }
 
