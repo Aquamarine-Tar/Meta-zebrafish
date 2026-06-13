@@ -85,7 +85,7 @@ static Eigen::Vector3d ComputeUnbiasedTranslation(Worm* worm, const Eigen::Vecto
     return worm->EvalBodyTransform(ref, x).translation();
 }
 
-static void ConfigureBridge(PeridynoBridge* bridge, const std::string& mode)
+static void ConfigureBridge(PeridynoBridge* bridge, const std::string& mode, float max_force, float ramp_sec)
 {
     if (mode == "hydro")
     {
@@ -102,12 +102,11 @@ static void ConfigureBridge(PeridynoBridge* bridge, const std::string& mode)
         std::cerr << "bad mode: " << mode << " (use both|hydro)\n";
         std::exit(1);
     }
-    // 与 Environment.cpp 默认 FSI 参数一致
     bridge->SetSubsteps(24);
     bridge->SetContactParams(0.3f, 15.0f);
-    bridge->SetFlowRampTime(12.0f);
+    bridge->SetFlowRampTime(ramp_sec);
     bridge->SetHydroForceScale(1.0f);
-    bridge->SetMaxVertexForce(3.0f);
+    bridge->SetMaxVertexForce(max_force);
 }
 
 static bool RunOneMode(int argc, char** argv, const std::string& mode, const std::string& out_csv)
@@ -115,8 +114,12 @@ static bool RunOneMode(int argc, char** argv, const std::string& mode, const std
     const double seconds = ArgFloat(argc, argv, "--seconds", 3.0f);
     const double t_start = ArgFloat(argc, argv, "--t-start", 2.0f);
     const double t_end = ArgFloat(argc, argv, "--t-end", 3.0f);
+    const float max_force = ArgFloat(argc, argv, "--max-force", 5.0f);
+    const float ramp_sec = ArgFloat(argc, argv, "--ramp", 0.01f);
+    const int sim_hz_arg = ArgFloat(argc, argv, "--sim-hz", 960.0f);
 
     Environment env("data/fish.meta", false);
+    env.SetSimulationHz(sim_hz_arg);
     env.SetVolumeLogIntervalSteps(0);
     PeridynoBridge* bridge = env.GetFluidBridge();
     if (!bridge || !bridge->IsInitialized())
@@ -124,7 +127,7 @@ static bool RunOneMode(int argc, char** argv, const std::string& mode, const std
         std::cerr << "RESULT status=fail reason=no_fluid_bridge mode=" << mode << std::endl;
         return false;
     }
-    ConfigureBridge(bridge, mode);
+    ConfigureBridge(bridge, mode, max_force, ramp_sec);
 
     const int sim_hz = (int)env.GetSimulationHz();
     const int ctrl_hz = (int)env.GetControlHz();
@@ -141,7 +144,10 @@ static bool RunOneMode(int argc, char** argv, const std::string& mode, const std
 
     std::cout << "=== unbiased disp record mode=" << mode
               << " seconds=" << seconds
+              << " sim_hz=" << sim_hz
               << " window=[" << t_start << "," << t_end << "]"
+              << " max_force=" << max_force
+              << " ramp_sec=" << ramp_sec
               << " contact=" << (bridge->GetEnableContactRepulsion() ? 1 : 0)
               << " hydro=" << (bridge->GetEnableHydroPressure() ? 1 : 0)
               << " -> " << out_csv << " ===\n";

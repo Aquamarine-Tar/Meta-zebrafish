@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -165,6 +166,19 @@ static RunSummary RunExperiment(int argc, char** argv)
     double max_hydro_peak = 0.0;
     int fsi_windows = 0;
 
+    // 记录质心轨迹（每整数秒采样）
+    std::vector<Eigen::Vector3d> com_trajectory;
+    {
+        const auto& x = env.GetSoftWorld()->GetPositions();
+        Eigen::Vector3d com0 = Eigen::Vector3d::Zero();
+        int nv = (int)(x.size() / 3);
+        for (int i = 0; i < nv; ++i)
+            com0 += Eigen::Vector3d(x(3*i), x(3*i+1), x(3*i+2));
+        com0 /= nv;
+        com_trajectory.push_back(com0);
+        printf("[COM t=0.0s] x=%.6f y=%.6f z=%.6f\n", com0.x(), com0.y(), com0.z());
+    }
+
     for (int step = 0; step < total_steps; ++step)
     {
         if (step % ratio == 0)
@@ -179,9 +193,50 @@ static RunSummary RunExperiment(int argc, char** argv)
         const auto t1 = std::chrono::high_resolution_clock::now();
         sum_step_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-        // 每整仿真秒采集 FSI 力统计（与 Environment 日志窗口一致）
+        // 每整仿真秒采集：FSI 力统计 + COM + 体积诊断 + t=2s 顶点力快照
         if ((step + 1) % sim_hz == 0)
         {
+            const double sim_t = (step + 1) / (double)sim_hz;
+
+            // t=2s 时刻：保存逐顶点受力快照到 CSV
+            if (fabs(sim_t - 2.0) < 1e-6) {
+                const auto& fv = bridge->GetLastFsiVertexForceSnapshot();
+                const auto& pos = env.GetSoftWorld()->GetPositions();
+                int nv = (int)(fv.total.size() / 3);
+                std::ofstream csv("vertex_forces_t2s.csv");
+                csv << "vid,pos_x,pos_y,pos_z,contact_fx,contact_fy,contact_fz,"
+                    << "hydro_fx,hydro_fy,hydro_fz,total_fx,total_fy,total_fz,f_mag\n";
+                for (int i = 0; i < nv; ++i) {
+                    double cx = fv.contact(3*i), cy = fv.contact(3*i+1), cz = fv.contact(3*i+2);
+                    double hx = fv.hydro(3*i),   hy = fv.hydro(3*i+1),   hz = fv.hydro(3*i+2);
+                    double fm = sqrt((cx+hx)*(cx+hx) + (cy+hy)*(cy+hy) + (cz+hz)*(cz+hz));
+                    csv << i << ","
+                        << pos(3*i) << "," << pos(3*i+1) << "," << pos(3*i+2) << ","
+                        << cx << "," << cy << "," << cz << ","
+                        << hx << "," << hy << "," << hz << ","
+                        << cx+hx << "," << cy+hy << "," << cz+hz << ","
+                        << fm << "\n";
+                }
+                csv.close();
+                printf("[DUMP] Wrote %d vertex forces to vertex_forces_t2s.csv\n", nv);
+            }
+
+            // COM
+            {
+                const auto& x = env.GetSoftWorld()->GetPositions();
+                Eigen::Vector3d com = Eigen::Vector3d::Zero();
+                int nv = (int)(x.size() / 3);
+                for (int i = 0; i < nv; ++i)
+                    com += Eigen::Vector3d(x(3*i), x(3*i+1), x(3*i+2));
+                com /= nv;
+                com_trajectory.push_back(com);
+                Eigen::Vector3d disp = com - com_trajectory[0];
+                printf("[COM t=%.1fs] x=%.6f y=%.6f z=%.6f disp_xyz=[%.6f, %.6f, %.6f] disp_mag=%.6f\n",
+                       sim_t, com.x(), com.y(), com.z(),
+                       disp.x(), disp.y(), disp.z(), disp.norm());
+            }
+
+            // FSI force
             const FsiForceDiagnostics fsi = bridge->ConsumeSecondFsiForceDiagnostics();
             if (fsi.frames > 0)
             {
@@ -191,13 +246,16 @@ static RunSummary RunExperiment(int argc, char** argv)
                 max_hydro_peak = std::max(max_hydro_peak, fsi.hydro_peak_n);
                 ++fsi_windows;
 
-                const double sim_t = (step + 1) / (double)sim_hz;
                 std::cout << "[t=" << sim_t << "s] contact_avg=" << fsi.contact_total_avg_n
                           << " contact_peak=" << fsi.contact_peak_n
                           << " hydro_avg=" << fsi.hydro_total_avg_n
                           << " hydro_peak=" << fsi.hydro_peak_n
                           << std::endl;
             }
+
+            // 体积诊断（每仿真秒）
+            VolumeStats vs = env.GetCreature()->ComputeVolumeStats(env.GetSoftWorld()->GetPositions());
+            printf("[VOL t=%.1fs] ratio=%.6f inverted=%d\n", sim_t, vs.volume_ratio, vs.inverted_tets);
         }
     }
 
@@ -210,6 +268,7 @@ static RunSummary RunExperiment(int argc, char** argv)
     summary.fsi_windows = fsi_windows;
 
     const double vol_shrink_pct = (1.0 - summary.final_stats.volume_ratio) * 100.0;
+    Eigen::Vector3d final_com_disp = com_trajectory.back() - com_trajectory.front();
     std::cout << "RESULT mode=" << mode
               << " status=ok"
               << " seconds=" << seconds
@@ -226,6 +285,10 @@ static RunSummary RunExperiment(int argc, char** argv)
               << " hydro_total_avg_n=" << summary.hydro_total_avg_n
               << " hydro_peak_n=" << summary.hydro_peak_n
               << " avg_step_ms=" << summary.avg_step_ms
+              << " com_dispx=" << final_com_disp.x()
+              << " com_dispy=" << final_com_disp.y()
+              << " com_dispz=" << final_com_disp.z()
+              << " com_disp_mag=" << final_com_disp.norm()
               << std::endl;
     return summary;
 }

@@ -143,6 +143,14 @@ void World::RemoveConstraint(Constraint* c)
 	}
 }
 
+void World::SetTimeStep(double time_step)
+{
+	if (time_step <= 0.0) return;
+	mTimeStep = time_step;
+	if (mIsInitialized)
+		PreComputation();
+}
+
 void World::TimeStepping(bool isIntegrated)
 {
 	if(!mIsInitialized) {

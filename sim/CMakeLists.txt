@@ -35,6 +35,7 @@ file(GLOB srcs "*.h" "*.cpp")
 # 过滤测试文件
 list(FILTER srcs EXCLUDE REGEX ".*test\\.cpp$")
 file(GLOB fluid_srcs "fluid/*.h" "fluid/*.cu")
+list(FILTER fluid_srcs EXCLUDE REGEX ".*VariationalApproximateProjection.*")
 file(GLOB util_srcs "util/*.h" "util/*.cpp" "util/json/*.h" "util/json/*.cpp")
 # find_package(DART REQUIRED COMPONENTS utils-urdf gui optimizer-ipopt CONFIG)
 # add_compile_options(-DHAVE_CSTDDEF)
@@ -118,6 +119,19 @@ target_include_directories(headless_test PRIVATE
 )
 target_link_libraries(headless_test sim CUDA::cudart ${Boost_LIBRARIES} ${PYTHON_LIBRARIES})
 set_target_properties(headless_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+
+# 30 帧水压力顶点力快速检查
+add_executable(hydro_30frame hydro_30frame.test.cpp)
+target_include_directories(hydro_30frame PRIVATE
+    ${PROJECT_SOURCE_DIR}
+    ${EIGEN3_INCLUDE_DIR}
+    ${PYTHON_INCLUDE_DIR}
+    ${Boost_INCLUDE_DIRS}
+)
+target_link_libraries(hydro_30frame sim CUDA::cudart ${Boost_LIBRARIES} ${PYTHON_LIBRARIES})
+set_target_properties(hydro_30frame PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
 

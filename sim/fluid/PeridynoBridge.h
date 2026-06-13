@@ -75,7 +75,7 @@ public:
     // damping:   法向阻尼系数, 默认 1.0
     void SetContactParams(float stiffness, float damping);
 
-    // 来流 ramp 时间（秒），力缩放 ~ ramp^2
+    // 来流 ramp 时间（秒），力缩放 ~ ramp
     void SetFlowRampTime(float seconds);
     float GetFlowRampTime() const { return m_flow_ramp_time; }
 
@@ -120,6 +120,9 @@ public:
 
 private:
     void InitFluidParticles();
+    void FreeVapGpuBuffers();
+    void EnsureVapGpuCapacity(int num_fluid, int num_ghost);
+    void RunVapSubstepImpl(float dt_sub, float ghost_time_offset, int bs);
 
     struct Impl;
     Impl* m_impl;
@@ -151,4 +154,11 @@ private:
     int m_roll_frame_count = 0;
 
     FsiVertexForceSnapshot m_last_fsi_snapshot;
+
+    // 表面拓扑：用于零水压顶点的邻域插值
+    std::vector<uint8_t> m_on_surface;
+    std::vector<std::vector<int>> m_surface_adj;
+    void RebuildSurfaceAdjacency(int nv, const std::vector<Eigen::Vector3i>& faces);
+    void FillZeroHydroFromNeighbors(
+        std::vector<float>& hx, std::vector<float>& hy, std::vector<float>& hz, int nv) const;
 };

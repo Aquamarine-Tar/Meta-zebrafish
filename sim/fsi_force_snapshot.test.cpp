@@ -209,6 +209,9 @@ int main(int argc, char** argv)
     double seconds = 3.0;
     double t_start = 2.0;
     double t_step = 0.25;
+    float max_force = 5.0f;
+    float ramp_sec = 0.01f;
+    int sim_hz_arg = 960;
     bool torque_only = false;
     for (int i = 1; i < argc; ++i)
     {
@@ -218,11 +221,15 @@ int main(int argc, char** argv)
         else if (i + 1 < argc && k == "--seconds") { seconds = std::atof(argv[++i]); }
         else if (i + 1 < argc && k == "--t-start") { t_start = std::atof(argv[++i]); }
         else if (i + 1 < argc && k == "--t-step") { t_step = std::atof(argv[++i]); }
+        else if (i + 1 < argc && k == "--max-force") { max_force = std::atof(argv[++i]); }
+        else if (i + 1 < argc && k == "--ramp") { ramp_sec = std::atof(argv[++i]); }
+        else if (i + 1 < argc && k == "--sim-hz") { sim_hz_arg = std::atoi(argv[++i]); }
     }
 
     EnsureDir(out_dir);
 
     Environment env("data/fish.meta", false);
+    env.SetSimulationHz(sim_hz_arg);
     env.SetVolumeLogIntervalSteps(0);
 
     PeridynoBridge* bridge = env.GetFluidBridge();
@@ -231,6 +238,13 @@ int main(int argc, char** argv)
         std::cerr << "fail: no fluid bridge\n";
         return 1;
     }
+    bridge->SetSubsteps(24);
+    bridge->SetContactParams(0.3f, 15.0f);
+    bridge->SetFlowRampTime(ramp_sec);
+    bridge->SetHydroForceScale(1.0f);
+    bridge->SetMaxVertexForce(max_force);
+    bridge->SetEnableContactRepulsion(false);
+    bridge->SetEnableHydroPressure(true);
 
     const int sim_hz = (int)env.GetSimulationHz();
     const int ctrl_hz = (int)env.GetControlHz();
@@ -250,8 +264,8 @@ int main(int argc, char** argv)
     std::cout << "=== FSI snapshot ===\n"
               << "seconds=" << seconds << " sim_hz=" << sim_hz
               << " t=[" << t_start << "," << seconds << "] step=" << t_step
-              << " torque_only=" << (torque_only ? 1 : 0)
-              << " (Environment FSI params)\n";
+              << " max_force=" << max_force << " ramp_sec=" << ramp_sec
+              << " torque_only=" << (torque_only ? 1 : 0) << '\n';
 
     for (int step = 0; step < total_steps; ++step)
     {

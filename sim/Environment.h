@@ -24,6 +24,7 @@ public:
 	Worm* GetCreature() {return mCreature;};
 
     double GetSimulationHz() { return mSimulationHz; };
+    void SetSimulationHz(int hz);
     double GetControlHz() { return mControlHz; };
     PeridynoBridge* GetFluidBridge() { return mFluidBridge; };
     int GetNumIters() { return mCurrIters; };

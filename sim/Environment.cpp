@@ -32,7 +32,7 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
     if (enable_key_worm)
         mArgParser->LoadFile("args/train_worm_swim_args.txt");
 	
-	mSimulationHz = 240;    // todo read by parser
+	mSimulationHz = 960;    // FSI 显式加力：960Hz（dt² 为 240Hz 的 1/16）
     mControlHz = 30;
     mVolumeLogIntervalSteps = mSimulationHz;  // 初始步 + 每整仿真秒输出一次
     mCurrIters = 0;
@@ -62,7 +62,7 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
     // 流体域约为原尺寸的 2 倍，以鱼体 AABB 中心为域中心
     mFluidBridge = new PeridynoBridge();
     float particle_spacing = 0.01f;  // 1cm 分辨率，鱼体横向约 13 个粒子
-    Eigen::Vector3d flow_velocity(0, 0, 0);  // 流速
+    Eigen::Vector3d flow_velocity(0, 0, -0.05);  // 流速
     Eigen::Vector3d fish_min = mCreature->GetMeshBBMin();
     Eigen::Vector3d fish_max = mCreature->GetMeshBBMax();
     const Eigen::Vector3d fish_center = 0.5 * (fish_min + fish_max);
@@ -81,9 +81,9 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
     // FSI 稳定性调参（fsi_stability 5s 验证: vol≈0.96, inverted≤8）
     mFluidBridge->SetSubsteps(24);
     mFluidBridge->SetContactParams(0.3f, 15.0f);
-    mFluidBridge->SetFlowRampTime(12.0f);
+    mFluidBridge->SetFlowRampTime(1.0f);
     mFluidBridge->SetHydroForceScale(1.0f);  // 渐进恢复水压力积分（细扫: vol≈0.96, inverted=13）
-    mFluidBridge->SetMaxVertexForce(3.0f);    // 顶点力上限 (N)
+    mFluidBridge->SetMaxVertexForce(5.0f);    // 顶点力上限 (N)
     mFluidBridge->SetEnableContactRepulsion(false);  // 关闭接触斥力
     std::cout << "[Environment] GPU SPH solver initialized." << std::endl;
     std::cout << "[Environment] Fluid domain (fish-centered): "
@@ -142,6 +142,16 @@ Environment::~Environment()
         delete mFluidBridge;
         mFluidBridge = nullptr;
     }
+}
+
+void Environment::SetSimulationHz(int hz)
+{
+    if (hz < 1) return;
+    mSimulationHz = hz;
+    if (mSoftWorld)
+        mSoftWorld->SetTimeStep(1.0 / static_cast<double>(mSimulationHz));
+    if (mVolumeLogIntervalSteps > 0)
+        mVolumeLogIntervalSteps = mSimulationHz;
 }
 
 namespace {

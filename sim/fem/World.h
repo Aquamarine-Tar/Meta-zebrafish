@@ -37,6 +37,7 @@ public:
 	void								SetExternalForce(Eigen::VectorXd external_force);
 	const Eigen::VectorXd&				GetExternalForce() {return mExternalForces;};
 
+	void								SetTimeStep(double time_step);
 	const double&						GetTimeStep(){ return mTimeStep; };
 	const double&						GetTime(){ return mTime; };
 
