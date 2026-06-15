@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Dense>
+#include <string>
 #include <vector>
 
 /**
@@ -43,6 +44,18 @@ struct FsiVertexForceSnapshot {
     bool valid = false;
 };
 
+/** t=某时刻 VAP band 诊断汇总（ExportVapBandDiagnostics） */
+struct VapBandDiagnosticsSummary {
+    int n_band_fluid = 0;
+    int n_band_mask_fluid = 0;
+    double avg_ghost_fluid_neighbor_ratio = 0.0;
+    double avg_surface_nearest_fluid_dist = 0.0;
+    double avg_fluid_influence = 0.0;
+    double avg_ghost_influence = 0.0;
+    double ghost_influence_fraction = 0.0;
+    bool valid = false;
+};
+
 class PeridynoBridge
 {
 public:
@@ -79,6 +92,10 @@ public:
     void SetFlowRampTime(float seconds);
     float GetFlowRampTime() const { return m_flow_ramp_time; }
 
+    // 目标来流速度 [m/s]（初始化后仍可改，用于 headless 扫参）
+    void SetFlowVelocity(const Eigen::Vector3d& flow_velocity);
+    Eigen::Vector3d GetFlowVelocity() const { return m_flow_velocity; }
+
     // SPH 压力积分水动力全局缩放 [0,1]（运行时；编译期 ENABLE_HYDRO_PRESSURE 可完全剔除代码）
     void SetHydroForceScale(float scale);
     float GetHydroForceScale() const { return m_hydro_force_scale; }
@@ -112,17 +129,35 @@ public:
     // 最近一次 ComputeFluidForces 的分轨快照（positions 为 SetFishBoundary 上传时的顶点位置）
     const FsiVertexForceSnapshot& GetLastFsiVertexForceSnapshot() const { return m_last_fsi_snapshot; }
 
+    /** 导出当前 GPU 上 VAP merged 状态（须在 ComputeFluidForces 之后调用） */
+    VapBandDiagnosticsSummary ExportVapBandDiagnostics(const std::string& out_prefix) const;
+
     bool IsInitialized() const { return m_initialized; }
     int  GetFluidParticleCount() const;
     void GetFluidParticles(std::vector<float>& positions) const;
     void GetFluidVelocities(std::vector<float>& velocities) const;
     float GetParticleSpacing() const { return m_particle_spacing; }
 
+    // VAP ghost 均匀降采样：stride=1 全表面顶点，3≈1/3，4≈1/4
+    void SetGhostSampleStride(int stride);
+    int GetGhostSampleStride() const { return m_ghost_sample_stride; }
+    int GetGhostVertexCount() const;
+    int GetGhostSurfaceFullCount() const { return m_ghost_surface_full_count; }
+
+    /** VAP ghost 近壁耦合整体缩放（1=默认；<1 减弱 ghost 对 band 流体的约束） */
+    void SetVapGhostCouplingScales(float divergence_scale, float velocity_penalty_scale);
+    float GetVapGhostDivergenceScale() const { return m_vap_ghost_div_scale; }
+    float GetVapGhostVelocityPenaltyScale() const { return m_vap_ghost_vel_scale; }
+
 private:
     void InitFluidParticles();
     void FreeVapGpuBuffers();
+    void FreeGhostGpuBuffers();
     void EnsureVapGpuCapacity(int num_fluid, int num_ghost);
-    void RunVapSubstepImpl(float dt_sub, float ghost_time_offset, int bs);
+    void RunVapSubstepImpl(float dt_sub, float ghost_time_offset, int bs, bool band_already_marked = false);
+    void RebuildGhostVertexList(int nv);
+    void EnsureGhostGpuBuffers();
+    void GatherGhostBoundaryData();
 
     struct Impl;
     Impl* m_impl;
@@ -155,7 +190,13 @@ private:
 
     FsiVertexForceSnapshot m_last_fsi_snapshot;
 
-    // 表面拓扑：用于零水压顶点的邻域插值
+    int m_ghost_sample_stride = 1;
+    int m_ghost_surface_full_count = 0;
+    float m_vap_ghost_div_scale = 1.0f;
+    float m_vap_ghost_vel_scale = 1.0f;
+
+    // 表面拓扑：用于零水压顶点的邻域插值；m_ghost_vertex_indices 为 VAP ghost 紧凑索引
+    std::vector<int> m_ghost_vertex_indices;
     std::vector<uint8_t> m_on_surface;
     std::vector<std::vector<int>> m_surface_adj;
     void RebuildSurfaceAdjacency(int nv, const std::vector<Eigen::Vector3i>& faces);

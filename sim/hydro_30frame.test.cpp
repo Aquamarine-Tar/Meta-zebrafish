@@ -55,6 +55,14 @@ static int ArgInt(int argc, char** argv, const char* key, int def)
     return def;
 }
 
+static std::string ArgString(int argc, char** argv, const char* key, const std::string& def)
+{
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == key)
+            return std::string(argv[i + 1]);
+    return def;
+}
+
 static Eigen::Vector3d ComputeCom(const Eigen::VectorXd& positions)
 {
     const int n = (int)(positions.size() / 3);
@@ -62,6 +70,13 @@ static Eigen::Vector3d ComputeCom(const Eigen::VectorXd& positions)
     for (int i = 0; i < n; ++i)
         com += positions.segment<3>(3 * i);
     return com / std::max(n, 1);
+}
+
+/** 无偏位移：参考构形 → 当前构形的刚体配准平移（同可视化绿色轨迹） */
+static Eigen::Vector3d ComputeUnbiasedTranslation(Worm* worm, const Eigen::VectorXd& x)
+{
+    const Eigen::VectorXd& ref = worm->GetVerticesReference();
+    return worm->EvalBodyTransform(ref, x).translation();
 }
 
 static int CountZeroHydroSurface(
@@ -88,7 +103,12 @@ int main(int argc, char** argv)
     const int sim_hz_arg = ArgInt(argc, argv, "--sim-hz", 960);
     const float ramp_sec = ArgFloat(argc, argv, "--ramp", 0.01f);
     const float max_force = ArgFloat(argc, argv, "--max-force", 3.0f);
+    const int substeps = ArgInt(argc, argv, "--substeps", 24);
+    const int ghost_stride = ArgInt(argc, argv, "--ghost-stride", 1);
     const int log_every = ArgInt(argc, argv, "--log-every", 0);  // 0=自动
+    const float diag_at = ArgFloat(argc, argv, "--diag-at", -1.0f);
+    const std::string diag_out = ArgString(argc, argv, "--diag-out", "vap_band_diag_t3/vap_band");
+    const int diag_step = (diag_at > 0.0f) ? (int)(diag_at * sim_hz_arg + 0.5f) : -1;
 
     Environment env("data/fish.meta", false);
     env.SetSimulationHz(sim_hz_arg);
@@ -103,13 +123,17 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    bridge->SetSubsteps(24);
+    bridge->SetSubsteps(substeps);
     bridge->SetContactParams(0.3f, 15.0f);
     bridge->SetFlowRampTime(ramp_sec);
     bridge->SetHydroForceScale(1.0f);
     bridge->SetMaxVertexForce(max_force);
     bridge->SetEnableContactRepulsion(false);
     bridge->SetEnableHydroPressure(true);
+    bridge->SetGhostSampleStride(ghost_stride);
+    const float ghost_div_scale = ArgFloat(argc, argv, "--ghost-div-scale", 1.0f);
+    const float ghost_vel_scale = ArgFloat(argc, argv, "--ghost-vel-scale", 1.0f);
+    bridge->SetVapGhostCouplingScales(ghost_div_scale, ghost_vel_scale);
 
     const int ctrl_hz = (int)env.GetControlHz();
     const int ratio = sim_hz / ctrl_hz;
@@ -129,13 +153,20 @@ int main(int argc, char** argv)
               << " t_sec=" << (total_frames / (double)sim_hz)
               << " ramp_sec=" << ramp_sec
               << " max_force=" << max_force
+              << " substeps=" << substeps
+              << " ghost_stride=" << ghost_stride
+              << " dx=" << bridge->GetParticleSpacing()
               << " hydro_scale=" << bridge->GetHydroForceScale()
+              << " ghost_div_scale=" << ghost_div_scale
+              << " ghost_vel_scale=" << ghost_vel_scale
               << " ===\n";
 
     Eigen::Vector3d com0 = ComputeCom(env.GetSoftWorld()->GetPositions());
+    const Eigen::Vector3d ub0 = ComputeUnbiasedTranslation(env.GetCreature(), env.GetSoftWorld()->GetPositions());
     double sum_step_ms = 0.0;
     VolumeStats last_vol{};
     int last_zero_surface = 0;
+    VapBandDiagnosticsSummary band_diag{};
 
     for (int step = 0; step < total_frames; ++step) {
         if (step % ratio == 0) {
@@ -155,7 +186,22 @@ int main(int argc, char** argv)
         last_vol = env.GetCreature()->ComputeVolumeStats(x);
         const Eigen::Vector3d com = ComputeCom(x);
         const Eigen::Vector3d disp = com - com0;
+        const Eigen::Vector3d ub = ComputeUnbiasedTranslation(env.GetCreature(), x);
+        const Eigen::Vector3d ub_disp = ub - ub0;
         last_zero_surface = CountZeroHydroSurface(bridge->GetLastFsiVertexForceSnapshot(), surface_vertices);
+
+        if (diag_step > 0 && step + 1 == diag_step) {
+            band_diag = bridge->ExportVapBandDiagnostics(diag_out);
+            std::cout << "[band_diag t=" << sim_t << "s]"
+                      << " n_band=" << band_diag.n_band_fluid
+                      << " n_mask=" << band_diag.n_band_mask_fluid
+                      << " avg_ghost/fluid_nbr_ratio=" << band_diag.avg_ghost_fluid_neighbor_ratio
+                      << " avg_surf_nearest_fluid_dist=" << band_diag.avg_surface_nearest_fluid_dist
+                      << " avg_fluid_inf=" << band_diag.avg_fluid_influence
+                      << " avg_ghost_inf=" << band_diag.avg_ghost_influence
+                      << " ghost_inf_frac=" << band_diag.ghost_influence_fraction
+                      << " out=" << diag_out << "\n";
+        }
 
         if ((step + 1) % log_stride == 0 || step + 1 == total_frames) {
             std::cout << "[step " << (step + 1) << " t=" << sim_t << "s]"
@@ -164,7 +210,9 @@ int main(int argc, char** argv)
                       << " inv=" << last_vol.inverted_tets
                       << " com=(" << com.x() << "," << com.y() << "," << com.z() << ")"
                       << " disp=(" << disp.x() << "," << disp.y() << "," << disp.z() << ")"
+                      << " ub_disp=(" << ub_disp.x() << "," << ub_disp.y() << "," << ub_disp.z() << ")"
                       << " disp_z=" << disp.z()
+                      << " ub_disp_z=" << ub_disp.z()
                       << " hydro_zero_surf=" << last_zero_surface << "\n";
         }
     }
@@ -172,8 +220,15 @@ int main(int argc, char** argv)
     const FsiForceDiagnostics fsi = bridge->ConsumeSecondFsiForceDiagnostics();
     const Eigen::Vector3d com_final = ComputeCom(env.GetSoftWorld()->GetPositions());
     const Eigen::Vector3d disp_final = com_final - com0;
+    const Eigen::Vector3d ub_final = ComputeUnbiasedTranslation(env.GetCreature(), env.GetSoftWorld()->GetPositions());
+    const Eigen::Vector3d ub_disp_final = ub_final - ub0;
+    const int surf_n = (int)surface_vertices.size();
+    const int hydro_nonzero_surf = std::max(0, surf_n - last_zero_surface);
+    const double hydro_nonzero_pct = 100.0 * hydro_nonzero_surf / std::max(surf_n, 1);
 
     std::cout << "SUMMARY sim_hz=" << sim_hz
+              << " substeps=" << substeps
+              << " dx=" << bridge->GetParticleSpacing()
               << " max_force=" << max_force
               << " frames=" << total_frames
               << " t_sec=" << (total_frames / (double)sim_hz)
@@ -181,12 +236,33 @@ int main(int argc, char** argv)
               << " final_vol=" << last_vol.volume_ratio
               << " vol_shrink_pct=" << ((1.0 - last_vol.volume_ratio) * 100.0)
               << " final_inverted=" << last_vol.inverted_tets
+              << " com_disp=(" << disp_final.x() << "," << disp_final.y() << "," << disp_final.z() << ")"
+              << " ub_disp=(" << ub_disp_final.x() << "," << ub_disp_final.y() << "," << ub_disp_final.z() << ")"
               << " com_disp_z=" << disp_final.z()
+              << " ub_disp_z=" << ub_disp_final.z()
               << " com_disp_mag=" << disp_final.norm()
+              << " ub_disp_mag=" << ub_disp_final.norm()
               << " hydro_surface_zero=" << last_zero_surface
+              << " hydro_nonzero_surf=" << hydro_nonzero_surf
+              << " hydro_nonzero_pct=" << hydro_nonzero_pct
+              << " ghost_stride=" << ghost_stride
+              << " ghost_count=" << bridge->GetGhostVertexCount()
+              << " ghost_div_scale=" << ghost_div_scale
+              << " ghost_vel_scale=" << ghost_vel_scale
               << " roll_hydro_avg=" << fsi.hydro_total_avg_n
               << " roll_hydro_peak=" << fsi.hydro_peak_n
               << "\n";
+    if (band_diag.valid) {
+        std::cout << "BAND_DIAG n_band=" << band_diag.n_band_fluid
+                  << " avg_ghost_fluid_ratio=" << band_diag.avg_ghost_fluid_neighbor_ratio
+                  << " avg_surf_nearest_fluid_dist=" << band_diag.avg_surface_nearest_fluid_dist
+                  << " avg_fluid_influence=" << band_diag.avg_fluid_influence
+                  << " avg_ghost_influence=" << band_diag.avg_ghost_influence
+                  << " fluid_influence_fraction=" << (1.0 - band_diag.ghost_influence_fraction)
+                  << " ghost_influence_fraction=" << band_diag.ghost_influence_fraction
+                  << " csv=" << diag_out << "_band_particles.csv"
+                  << "\n";
+    }
     std::cout << "RESULT status=ok"
               << " sim_hz=" << sim_hz
               << " max_force=" << max_force
@@ -194,7 +270,12 @@ int main(int argc, char** argv)
               << " volume_ratio=" << last_vol.volume_ratio
               << " inverted=" << last_vol.inverted_tets
               << " com_disp_z=" << disp_final.z()
+              << " ub_disp_z=" << ub_disp_final.z()
               << " com_disp_mag=" << disp_final.norm()
+              << " ub_disp_mag=" << ub_disp_final.norm()
+              << " hydro_nonzero_pct=" << hydro_nonzero_pct
+              << " ghost_stride=" << ghost_stride
+              << " ghost_count=" << bridge->GetGhostVertexCount()
               << "\n";
     return 0;
 }

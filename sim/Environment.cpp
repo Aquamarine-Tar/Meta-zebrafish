@@ -1,10 +1,13 @@
 #include "Environment.h"
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <fstream>
 #include <ctime>
 #include <iomanip>
+#include <set>
 #include <string>
 #include "util/json/json.h"
 #include "util/JsonUtil.h"
@@ -58,16 +61,16 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
 
     mSoftWorld->Initialize();
 
-    // 初始化 GPU SPH 流体求解器
-    // 流体域约为原尺寸的 2 倍，以鱼体 AABB 中心为域中心
+    // 初始化 GPU SPH 流体求解器（域以鱼体 AABB 中心为心，尺寸随鱼体缩放）
     mFluidBridge = new PeridynoBridge();
-    float particle_spacing = 0.01f;  // 1cm 分辨率，鱼体横向约 13 个粒子
+    float particle_spacing = 0.011f;  // 粒子分辨率，鱼体横向约 13 个粒子
     Eigen::Vector3d flow_velocity(0, 0, -0.05);  // 流速
     Eigen::Vector3d fish_min = mCreature->GetMeshBBMin();
     Eigen::Vector3d fish_max = mCreature->GetMeshBBMax();
     const Eigen::Vector3d fish_center = 0.5 * (fish_min + fish_max);
-  // 原域 0.4×0.3×0.65 m，扩大 2 倍 → 半轴 0.4×0.3×0.65
-    const Eigen::Vector3d domain_half(0.4, 0.3, 0.65);
+    const Eigen::Vector3d fish_size = fish_max - fish_min;
+    // x/y：恢复扩大前半轴；z：总长度 = 2×鱼体 z 向体长 → 半轴 = fish_size.z()
+    const Eigen::Vector3d domain_half(0.20, 0.15, fish_size.z());
     const Eigen::Vector3d fluid_min = fish_center - domain_half;
     const Eigen::Vector3d fluid_max = fish_center + domain_half;
     mFluidBridge->Initialize(fluid_min, fluid_max, particle_spacing,
@@ -78,8 +81,8 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
                              0.05f,
                              mSoftWorld->GetPositions(),
                              mCreature->GetContours());
-    // FSI 稳定性调参（fsi_stability 5s 验证: vol≈0.96, inverted≤8）
-    mFluidBridge->SetSubsteps(24);
+    // FSI 扫参（ramp=0.1, 0.5–1s: vol≈0.95, inverted≤6 @ combo sub18+Δx0.011）
+    mFluidBridge->SetSubsteps(18);
     mFluidBridge->SetContactParams(0.3f, 15.0f);
     mFluidBridge->SetFlowRampTime(1.0f);
     mFluidBridge->SetHydroForceScale(1.0f);  // 渐进恢复水压力积分（细扫: vol≈0.96, inverted=13）
@@ -88,7 +91,9 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
     std::cout << "[Environment] GPU SPH solver initialized." << std::endl;
     std::cout << "[Environment] Fluid domain (fish-centered): "
               << fluid_min.transpose() << " to " << fluid_max.transpose()
-              << "  fish_center=" << fish_center.transpose() << std::endl;
+              << "  fish_center=" << fish_center.transpose()
+              << "  domain_half=" << domain_half.transpose()
+              << "  fish_size=" << fish_size.transpose() << std::endl;
 
     mStateSize = mCreature->GetSamplingIndex().size()*6+6;      // todo
 
@@ -176,6 +181,56 @@ std::string WallClockTimestamp()
     return std::string(out);
 }
 
+static bool IsHalfSecondMark(double sim_t, int sim_hz)
+{
+    if (sim_t < 0.5 - 1e-9)
+        return false;
+    const int half_step = (int)std::lround(sim_t * 2.0);
+    const double target_t = half_step * 0.5;
+    return std::abs(sim_t - target_t) < 0.5 / sim_hz;
+}
+
+static Eigen::Vector3d ComputeVertexCom(const Eigen::VectorXd& positions)
+{
+    const int n = (int)(positions.size() / 3);
+    Eigen::Vector3d com = Eigen::Vector3d::Zero();
+    for (int i = 0; i < n; ++i)
+        com += positions.segment<3>(3 * i);
+    return com / std::max(n, 1);
+}
+
+static void LogHalfSecondSurfaceMonitor(
+    double sim_t,
+    int iter,
+    const FsiVertexForceSnapshot& snap,
+    const Eigen::VectorXd& positions,
+    const std::vector<Eigen::Vector3i>& contours)
+{
+    std::set<int> surface;
+    for (const auto& tri : contours)
+    {
+        surface.insert(tri[0]);
+        surface.insert(tri[1]);
+        surface.insert(tri[2]);
+    }
+
+    int nonzero = 0;
+    for (int i : surface)
+    {
+        const double hx = snap.hydro(3 * i);
+        const double hy = snap.hydro(3 * i + 1);
+        const double hz = snap.hydro(3 * i + 2);
+        if (hx * hx + hy * hy + hz * hz > 1e-24)
+            ++nonzero;
+    }
+
+    const int total = (int)surface.size();
+    const Eigen::Vector3d com = ComputeVertexCom(positions);
+    const double pct = 100.0 * nonzero / std::max(total, 1);
+    printf("[monitor t=%.6fs iter=%d] surface_nonzero_hydro=%d/%d (%.2f%%) com=(%.6f,%.6f,%.6f)\n",
+           sim_t, iter, nonzero, total, pct, com.x(), com.y(), com.z());
+}
+
 }  // namespace
 
 void Environment::Step()
@@ -206,6 +261,17 @@ void Environment::Step()
     const double sph_ms = std::chrono::duration<double, std::milli>(sph_end - sph_begin).count();
     const double fem_ms = std::chrono::duration<double, std::milli>(fem_end - fem_begin).count();
     const double step_ms = std::chrono::duration<double, std::milli>(fem_end - step_begin).count();
+    const double sim_time = mCurrIters / static_cast<double>(mSimulationHz);
+
+    if (IsHalfSecondMark(sim_time, mSimulationHz))
+    {
+        const FsiVertexForceSnapshot& snap = mFluidBridge->GetLastFsiVertexForceSnapshot();
+        if (snap.valid)
+        {
+            LogHalfSecondSurfaceMonitor(
+                sim_time, mCurrIters, snap, mSoftWorld->GetPositions(), contours);
+        }
+    }
 
     if (mCurrIters == 1 ||
         (mVolumeLogIntervalSteps > 0 && mCurrIters % mVolumeLogIntervalSteps == 0))

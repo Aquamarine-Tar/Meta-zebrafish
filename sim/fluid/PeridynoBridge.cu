@@ -23,6 +23,15 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -73,7 +82,7 @@ __host__ __device__ inline float3 normalize(const float3& v) {
 
 // 均匀网格加速：每格最多存放的粒子/三角面数量（超出则丢弃，影响精度）
 #define MAX_PARTICLES_PER_CELL  64
-#define MAX_FACES_PER_CELL      32
+#define MAX_FACES_PER_CELL      64
 // 光滑长度 h = particle_spacing × 该比值（默认 h = 2Δx）
 #define SPH_KERNEL_RADIUS_RATIO 2.0f
 
@@ -101,7 +110,15 @@ struct PeridynoBridge::Impl {
     // ---- FEM 鱼体边界顶点 (GPU)：每帧由 SetFishBoundary H2D 上传 ----
     float3* d_boundary_vertices   = nullptr;
     float3* d_boundary_velocities = nullptr;
+    float3* d_boundary_normals    = nullptr;
     int     num_boundary_vertices = 0;
+
+    // ---- VAP ghost：仅表面顶点紧凑缓冲（由 m_ghost_vertex_indices 索引）----
+    float3* d_ghost_vertices   = nullptr;
+    float3* d_ghost_velocities = nullptr;
+    float3* d_ghost_normals    = nullptr;
+    int*    d_ghost_vertex_indices = nullptr;
+    int     num_ghost_vertices = 0;
 
     // ---- 鱼体表面三角面 (GPU) ----
     int3*   d_face_indices  = nullptr;  // [num_faces] 三个顶点索引 (i0,i1,i2)
@@ -160,7 +177,6 @@ struct PeridynoBridge::Impl {
     bool initialized = false;
 
     // ---- VAP 窄带投影（ghost 顶点 + band 内流体）----
-    float3* d_boundary_normals = nullptr;
     unsigned char* d_vap_band_mask = nullptr;
     int* d_vap_prefix = nullptr;
     int* d_vap_fluid_to_merged = nullptr;
@@ -184,12 +200,16 @@ struct PeridynoBridge::Impl {
     int* d_vap_merged_grid_counts = nullptr;
     int* d_vap_merged_grid_particles = nullptr;
     float* d_vap_dot_partial = nullptr;
+    float* d_vap_dot_result  = nullptr;
     int*   d_vap_band_counter = nullptr;
     int vap_merged_capacity = 0;
     int vap_dot_partial_cap = 0;
     int vap_last_n_band = 0;
     float vap_alpha_max = 0.0f;
     float vap_a_max = 0.0f;
+    float last_dt_sub = 0.0f;
+    float vap_ghost_div_scale = 1.0f;
+    float vap_ghost_vel_scale = 1.0f;
 };
 
 // ==================== SPH 核函数（标准 WCSPH 形式）====================
@@ -818,8 +838,9 @@ __global__ void compute_vap_hydro_pressure_kernel(
     float3 fc = face_centers[f];
     float3 nf = face_normals[f];
     float  area = face_areas[f];
-    // band 标记用 2.5h，面积分采样须与之匹配，否则面心附近无粒子 → 顶点零力
+    // band 标记用 5h，面积分采样须与之匹配；权重核支撑半径也用 sample_radius
     const float sample_radius = h * VAP_BAND_H_MULT;
+    const float sample_h2 = sample_radius * sample_radius;
 
     // 在面心附近从 VAP 合并网格采样压力（仅 band 流体粒子）
     float  pressure_sum = 0.0f;
@@ -850,8 +871,8 @@ __global__ void compute_vap_hydro_pressure_kernel(
                     float  dist = length(r);
                     if (dist >= sample_radius) continue;
 
-                    // Poly6 核作为距离权重（支撑半径仍为 h）
-                    float w = poly6_kernel(dot(r, r), h, h * h);
+                    float w = poly6_kernel(dot(r, r), sample_radius, sample_h2);
+                    if (w <= 0.0f) continue;
                     pressure_sum += merged_pressures[p_idx] * w;
                     weight_sum   += w;
                     sample_count++;
@@ -860,8 +881,8 @@ __global__ void compute_vap_hydro_pressure_kernel(
         }
     }
 
-    // 网格哈希漏采时，对 band 流体粒子做线性回退
-    if (sample_count == 0 && n_band > 0) {
+    // 网格漏采或权重全零（旧实现：sample_count>0 但 w=0 时不走 fallback）
+    if (weight_sum < 1e-12f && n_band > 0) {
         float nearest_dist = 1e30f;
         float nearest_p = 0.0f;
         for (int i = 0; i < n_band; i++) {
@@ -873,14 +894,14 @@ __global__ void compute_vap_hydro_pressure_kernel(
                 nearest_p = merged_pressures[i];
             }
             if (dist >= sample_radius) continue;
-            float w = poly6_kernel(dot(r, r), h, h * h);
+            float w = poly6_kernel(dot(r, r), sample_radius, sample_h2);
+            if (w <= 0.0f) continue;
             pressure_sum += merged_pressures[i] * w;
             weight_sum   += w;
             sample_count++;
         }
-        // 面心附近完全无 band 粒子：用最近邻 band 压力外推（上限 2×sample_radius）
-        if (sample_count == 0 && nearest_dist < sample_radius * 2.0f) {
-            float w = poly6_kernel(nearest_dist * nearest_dist, h, h * h);
+        if (weight_sum < 1e-12f && nearest_dist < sample_radius * 2.0f) {
+            float w = poly6_kernel(nearest_dist * nearest_dist, sample_radius, sample_h2);
             if (w < 1e-12f) w = 1e-12f;
             pressure_sum = nearest_p * w;
             weight_sum = w;
@@ -961,10 +982,13 @@ __global__ void constrain_domain_kernel(
  * 与子步内 ramped_flow 配合，使流体逐渐加速到目标来流
  */
 __global__ void apply_ramped_flow_kernel(
-    float3* velocities, float3 target_flow, float ramp, int num_particles)
+    float3* velocities, float3 target_flow, float ramp,
+    const unsigned char* band_mask, int num_particles)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_particles) return;
+    // band 内粒子保留 VAP 修正速度，避免 ramp=1 时全域硬重置为来流
+    if (band_mask && band_mask[idx]) return;
     float3 v = velocities[idx];
     float one_minus = 1.0f - ramp;
     velocities[idx] = make_float3(
@@ -1078,6 +1102,8 @@ void PeridynoBridge::Initialize(
     p.flow_ramp_time = m_flow_ramp_time;
     p.hydro_force_scale = m_hydro_force_scale;
     p.max_vertex_force = m_max_vertex_force;
+    p.vap_ghost_div_scale = m_vap_ghost_div_scale;
+    p.vap_ghost_vel_scale = m_vap_ghost_vel_scale;
 
     // 流体网格参数
     float3 dmin = {(float)domain_min.x(), (float)domain_min.y(), (float)domain_min.z()};
@@ -1299,10 +1325,32 @@ void PeridynoBridge::SetFlowRampTime(float seconds)
     if (m_impl) m_impl->flow_ramp_time = m_flow_ramp_time;
 }
 
+void PeridynoBridge::SetFlowVelocity(const Eigen::Vector3d& flow_velocity)
+{
+    m_flow_velocity = flow_velocity;
+    if (m_impl)
+    {
+        m_impl->flow_velocity = {
+            (float)flow_velocity.x(),
+            (float)flow_velocity.y(),
+            (float)flow_velocity.z()};
+    }
+}
+
 void PeridynoBridge::SetHydroForceScale(float scale)
 {
     m_hydro_force_scale = std::max(0.0f, scale);
     if (m_impl) m_impl->hydro_force_scale = m_hydro_force_scale;
+}
+
+void PeridynoBridge::SetVapGhostCouplingScales(float divergence_scale, float velocity_penalty_scale)
+{
+    m_vap_ghost_div_scale = std::max(0.0f, divergence_scale);
+    m_vap_ghost_vel_scale = std::max(0.0f, velocity_penalty_scale);
+    if (m_impl) {
+        m_impl->vap_ghost_div_scale = m_vap_ghost_div_scale;
+        m_impl->vap_ghost_vel_scale = m_vap_ghost_vel_scale;
+    }
 }
 
 void PeridynoBridge::SetMaxVertexForce(float max_force)
@@ -1364,6 +1412,7 @@ void PeridynoBridge::Destroy()
 
     CUDA_SAFE_FREE(p.d_boundary_vertices);
     CUDA_SAFE_FREE(p.d_boundary_velocities);
+    CUDA_SAFE_FREE(p.d_boundary_normals);
     CUDA_SAFE_FREE(p.d_boundary_forces_contact_sub);
     CUDA_SAFE_FREE(p.d_boundary_forces_hydro_sub);
     CUDA_SAFE_FREE(p.d_boundary_forces_contact_frame);
@@ -1388,11 +1437,17 @@ void PeridynoBridge::Destroy()
     p.face_grid_allocated = false;
     p.initialized = false;
     m_initialized = false;
+    m_ghost_vertex_indices.clear();
+    m_on_surface.clear();
+    m_surface_adj.clear();
+    FreeGhostGpuBuffers();
+    p.num_ghost_vertices = 0;
     m_roll_sum_contact_total = 0.0;
     m_roll_sum_hydro_total   = 0.0;
     m_roll_peak_contact      = 0.0;
     m_roll_peak_hydro        = 0.0;
     m_roll_frame_count       = 0;
+    FreeGhostGpuBuffers();
     FreeVapGpuBuffers();
 }
 
@@ -1471,23 +1526,181 @@ void PeridynoBridge::FillZeroHydroFromNeighbors(
     }
 }
 
+/** 全局点积：block 内归约 + atomicAdd，仅 D2H 4 字节 */
+__global__ void vap_global_dot_kernel(
+    const float* a, const float* b, float* out, int n)
+{
+    __shared__ float cache[256];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+    float v = (i < n) ? a[i] * b[i] : 0.0f;
+    cache[tid] = v;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) cache[tid] += cache[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(out, cache[0]);
+}
+
 namespace {
 
-float VapHostDot(float* d_a, float* d_b, float* d_partial, float* h_partial, int n, int bs, int gs) {
-    vap_dot_kernel<<<gs, bs>>>(d_a, d_b, d_partial, n);
-    cudaMemcpy(h_partial, d_partial, gs * sizeof(float), cudaMemcpyDeviceToHost);
-    double s = 0.0;
-    for (int i = 0; i < gs; i++) s += h_partial[i];
-    return (float)s;
+float VapDeviceDot(float* d_a, float* d_b, float* d_result, int n, int bs, int gs)
+{
+    cudaMemset(d_result, 0, sizeof(float));
+    vap_global_dot_kernel<<<gs, bs>>>(d_a, d_b, d_result, n);
+    float h = 0.0f;
+    cudaMemcpy(&h, d_result, sizeof(float), cudaMemcpyDeviceToHost);
+    return h;
 }
 
 } // namespace
+
+/** GPU：由三角面累加并归一化顶点法向（替代 CPU ComputeVertexNormals） */
+__global__ void clear_float3_kernel(float3* arr, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) arr[i] = make_float3(0, 0, 0);
+}
+
+__global__ void accumulate_vertex_normals_kernel(
+    const float3* vertices, const int3* face_indices, float3* vertex_normals, int num_faces)
+{
+    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= num_faces) return;
+    int3 fi = face_indices[f];
+    float3 p0 = vertices[fi.x], p1 = vertices[fi.y], p2 = vertices[fi.z];
+    float3 e0 = p1 - p0, e1 = p2 - p0;
+    float3 fn = make_float3(
+        e0.y * e1.z - e0.z * e1.y,
+        e0.z * e1.x - e0.x * e1.z,
+        e0.x * e1.y - e0.y * e1.x);
+    atomicAdd(&vertex_normals[fi.x].x, fn.x);
+    atomicAdd(&vertex_normals[fi.x].y, fn.y);
+    atomicAdd(&vertex_normals[fi.x].z, fn.z);
+    atomicAdd(&vertex_normals[fi.y].x, fn.x);
+    atomicAdd(&vertex_normals[fi.y].y, fn.y);
+    atomicAdd(&vertex_normals[fi.y].z, fn.z);
+    atomicAdd(&vertex_normals[fi.z].x, fn.x);
+    atomicAdd(&vertex_normals[fi.z].y, fn.y);
+    atomicAdd(&vertex_normals[fi.z].z, fn.z);
+}
+
+__global__ void normalize_vertex_normals_kernel(float3* vertex_normals, int num_vertices)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_vertices) return;
+    vertex_normals[i] = normalize(vertex_normals[i]);
+}
+
+/** 从全体 FEM 顶点按表面索引 gather 出 VAP ghost 紧凑缓冲 */
+__global__ void gather_ghost_boundary_kernel(
+    const float3* all_vertices,
+    const float3* all_velocities,
+    const float3* all_normals,
+    const int* ghost_indices,
+    float3* ghost_vertices,
+    float3* ghost_velocities,
+    float3* ghost_normals,
+    int num_ghost)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= num_ghost) return;
+    const int idx = ghost_indices[g];
+    ghost_vertices[g]   = all_vertices[idx];
+    ghost_velocities[g] = all_velocities[idx];
+    ghost_normals[g]    = all_normals[idx];
+}
+
+void PeridynoBridge::SetGhostSampleStride(int stride)
+{
+    m_ghost_sample_stride = std::max(1, stride);
+}
+
+int PeridynoBridge::GetGhostVertexCount() const
+{
+    return (m_impl && m_impl->initialized) ? m_impl->num_ghost_vertices : 0;
+}
+
+void PeridynoBridge::RebuildGhostVertexList(int nv)
+{
+    m_ghost_vertex_indices.clear();
+    m_ghost_surface_full_count = 0;
+    if (nv <= 0 || (int)m_on_surface.size() != nv) {
+        if (m_impl) m_impl->num_ghost_vertices = 0;
+        return;
+    }
+    m_ghost_vertex_indices.reserve(nv);
+    for (int i = 0; i < nv; i++) {
+        if (m_on_surface[i])
+            m_ghost_vertex_indices.push_back(i);
+    }
+    m_ghost_surface_full_count = (int)m_ghost_vertex_indices.size();
+    const int stride = std::max(1, m_ghost_sample_stride);
+    if (stride > 1 && m_ghost_vertex_indices.size() > 1) {
+        std::vector<int> sampled;
+        sampled.reserve((m_ghost_vertex_indices.size() + stride - 1) / stride);
+        for (size_t i = 0; i < m_ghost_vertex_indices.size(); i += stride)
+            sampled.push_back(m_ghost_vertex_indices[i]);
+        m_ghost_vertex_indices.swap(sampled);
+    }
+    m_impl->num_ghost_vertices = (int)m_ghost_vertex_indices.size();
+}
+
+void PeridynoBridge::FreeGhostGpuBuffers()
+{
+    auto& p = *m_impl;
+    CUDA_SAFE_FREE(p.d_ghost_vertices);
+    CUDA_SAFE_FREE(p.d_ghost_velocities);
+    CUDA_SAFE_FREE(p.d_ghost_normals);
+    CUDA_SAFE_FREE(p.d_ghost_vertex_indices);
+}
+
+void PeridynoBridge::EnsureGhostGpuBuffers()
+{
+    auto& p = *m_impl;
+    const int ng = p.num_ghost_vertices;
+    FreeGhostGpuBuffers();
+    if (ng <= 0 || m_ghost_vertex_indices.empty()) {
+        p.num_ghost_vertices = 0;
+        return;
+    }
+    p.num_ghost_vertices = ng;
+    cudaMalloc(&p.d_ghost_vertices, ng * sizeof(float3));
+    cudaMalloc(&p.d_ghost_velocities, ng * sizeof(float3));
+    cudaMalloc(&p.d_ghost_normals, ng * sizeof(float3));
+    cudaMalloc(&p.d_ghost_vertex_indices, ng * sizeof(int));
+    cudaMemcpy(p.d_ghost_vertex_indices, m_ghost_vertex_indices.data(),
+               ng * sizeof(int), cudaMemcpyHostToDevice);
+    p.vap_alpha_max = 0.0f;
+    p.vap_a_max = 0.0f;
+    p.vap_merged_capacity = 0;
+}
+
+void PeridynoBridge::GatherGhostBoundaryData()
+{
+    auto& p = *m_impl;
+    const int ng = p.num_ghost_vertices;
+    if (ng <= 0 || !p.d_ghost_vertex_indices || !p.d_boundary_vertices ||
+        !p.d_boundary_velocities || !p.d_boundary_normals ||
+        !p.d_ghost_vertices || !p.d_ghost_velocities || !p.d_ghost_normals)
+        return;
+    const int bs = 256;
+    const int gs = (ng + bs - 1) / bs;
+    gather_ghost_boundary_kernel<<<gs, bs>>>(
+        p.d_boundary_vertices, p.d_boundary_velocities, p.d_boundary_normals,
+        p.d_ghost_vertex_indices,
+        p.d_ghost_vertices, p.d_ghost_velocities, p.d_ghost_normals,
+        ng);
+}
 
 void PeridynoBridge::EnsureVapGpuCapacity(int num_fluid, int num_ghost)
 {
     auto& p = *m_impl;
     if (!p.d_vap_band_counter)
         cudaMalloc(&p.d_vap_band_counter, sizeof(int));
+    if (!p.d_vap_dot_result)
+        cudaMalloc(&p.d_vap_dot_result, sizeof(float));
     int need_merged = num_fluid + num_ghost + 16;
     if (p.vap_merged_capacity >= need_merged) return;
     p.vap_merged_capacity = need_merged;
@@ -1570,20 +1783,20 @@ void PeridynoBridge::FreeVapGpuBuffers()
     CUDA_SAFE_FREE(p.d_vap_merged_grid_counts);
     CUDA_SAFE_FREE(p.d_vap_merged_grid_particles);
     CUDA_SAFE_FREE(p.d_vap_dot_partial);
+    CUDA_SAFE_FREE(p.d_vap_dot_result);
     CUDA_SAFE_FREE(p.d_vap_band_counter);
-    CUDA_SAFE_FREE(p.d_boundary_normals);
     p.vap_merged_capacity = 0;
     p.vap_alpha_max = 0.0f;
     p.vap_a_max = 0.0f;
 }
 
-void PeridynoBridge::RunVapSubstepImpl(float dt_sub, float ghost_time_offset, int bs)
+void PeridynoBridge::RunVapSubstepImpl(float dt_sub, float ghost_time_offset, int bs, bool band_already_marked)
 {
     auto& p = *m_impl;
     const int N = p.num_particles;
-    const int G = p.num_boundary_vertices;
-    if (N <= 0 || G <= 0 || !p.face_grid_allocated || !p.d_boundary_normals) return;
-    if (!p.d_boundary_velocities) return;
+    const int G = p.num_ghost_vertices;
+    if (N <= 0 || G <= 0 || !p.face_grid_allocated || !p.d_ghost_normals) return;
+    if (!p.d_ghost_velocities || !p.d_ghost_vertices) return;
 
     EnsureVapGpuCapacity(N, G);
     const int gsN = (N + bs - 1) / bs;
@@ -1591,10 +1804,12 @@ void PeridynoBridge::RunVapSubstepImpl(float dt_sub, float ghost_time_offset, in
     const int cells = p.grid_params.total_cells;
     const int cgs = (cells + bs - 1) / bs;
 
-    vap_clear_uchar_kernel<<<gsN, bs>>>(p.d_vap_band_mask, N);
-    vap_mark_band_kernel<<<gsN, bs>>>(
-        p.d_vap_band_mask, p.d_positions, p.d_face_centers,
-        p.d_face_grid_particles, p.face_grid_params, band_h, N, p.num_faces);
+    if (!band_already_marked) {
+        vap_clear_uchar_kernel<<<gsN, bs>>>(p.d_vap_band_mask, N);
+        vap_mark_band_kernel<<<gsN, bs>>>(
+            p.d_vap_band_mask, p.d_positions, p.d_face_centers,
+            p.d_face_grid_particles, p.face_grid_params, band_h, N, p.num_faces);
+    }
 
     vap_reset_counter_kernel<<<1, 1>>>(p.d_vap_band_counter);
     vap_scatter_fluid_atomic_kernel<<<gsN, bs>>>(
@@ -1610,7 +1825,7 @@ void PeridynoBridge::RunVapSubstepImpl(float dt_sub, float ghost_time_offset, in
     }
     p.vap_last_n_band = n_band;
     vap_scatter_ghost_kernel<<<(G + bs - 1) / bs, bs>>>(
-        p.d_boundary_vertices, p.d_boundary_velocities, p.d_boundary_normals,
+        p.d_ghost_vertices, p.d_ghost_velocities, p.d_ghost_normals,
         p.d_vap_merged_pos, p.d_vap_merged_vel, p.d_vap_merged_nrm, p.d_vap_merged_attr,
         n_band, G, ghost_time_offset);
 
@@ -1661,7 +1876,7 @@ void PeridynoBridge::RunVapSubstepImpl(float dt_sub, float ghost_time_offset, in
     vap_compute_divergence_kernel<<<gsM, bs>>>(
         p.d_vap_divergence, p.d_vap_alpha, p.d_vap_merged_pos, p.d_vap_merged_vel,
         p.d_vap_merged_nrm, p.d_vap_merged_attr, p.d_vap_neighbor_count, p.d_vap_neighbors,
-        VAP_SEPARATION, VAP_TANGENTIAL, p.rest_density, p.h, dt_sub, n_merged);
+        VAP_SEPARATION, VAP_TANGENTIAL, p.rest_density, p.h, dt_sub, p.vap_ghost_div_scale, n_merged);
     vap_compensate_source_kernel<<<gsM, bs>>>(
         p.d_vap_divergence, p.d_vap_merged_density, p.d_vap_merged_attr, p.rest_density, dt_sub, n_merged);
 
@@ -1675,8 +1890,7 @@ void PeridynoBridge::RunVapSubstepImpl(float dt_sub, float ghost_time_offset, in
     cudaMemcpy(p.d_vap_p, p.d_vap_r, n_merged * sizeof(float), cudaMemcpyDeviceToDevice);
 
     const int dot_gs = (n_merged + bs - 1) / bs;
-    std::vector<float> h_part(dot_gs, 0.0f);
-    float rr = VapHostDot(p.d_vap_r, p.d_vap_r, p.d_vap_dot_partial, h_part.data(), n_merged, bs, dot_gs);
+    float rr = VapDeviceDot(p.d_vap_r, p.d_vap_r, p.d_vap_dot_result, n_merged, bs, dot_gs);
     float err = sqrtf(fmaxf(rr / fmaxf(n_merged, 1), 0.0f));
 
     for (int it = 0; it < VAP_CG_MAX_ITER && err > VAP_CG_TOL; ++it) {
@@ -1684,13 +1898,13 @@ void PeridynoBridge::RunVapSubstepImpl(float dt_sub, float ghost_time_offset, in
         vap_compute_ax_kernel<<<gsM, bs>>>(
             p.d_vap_ax, p.d_vap_p, p.d_vap_aii, p.d_vap_alpha, p.d_vap_merged_pos,
             p.d_vap_merged_attr, p.d_vap_neighbor_count, p.d_vap_neighbors, p.h, n_merged);
-        float pAy = VapHostDot(p.d_vap_p, p.d_vap_ax, p.d_vap_dot_partial, h_part.data(), n_merged, bs, dot_gs);
+        float pAy = VapDeviceDot(p.d_vap_p, p.d_vap_ax, p.d_vap_dot_result, n_merged, bs, dot_gs);
         if (fabsf(pAy) < 1e-12f) break;
         float alpha_cg = rr / pAy;
         vap_saxpy_kernel<<<gsM, bs>>>(p.d_vap_pressure, p.d_vap_p, alpha_cg, n_merged);
         vap_saxpy_kernel<<<gsM, bs>>>(p.d_vap_r, p.d_vap_ax, -alpha_cg, n_merged);
         float rr_old = rr;
-        rr = VapHostDot(p.d_vap_r, p.d_vap_r, p.d_vap_dot_partial, h_part.data(), n_merged, bs, dot_gs);
+        rr = VapDeviceDot(p.d_vap_r, p.d_vap_r, p.d_vap_dot_result, n_merged, bs, dot_gs);
         float beta = rr / fmaxf(rr_old, 1e-12f);
         vap_update_p_kernel<<<gsM, bs>>>(p.d_vap_p, p.d_vap_r, beta, n_merged);
         err = sqrtf(fmaxf(rr / fmaxf(n_merged, 1), 0.0f));
@@ -1699,7 +1913,7 @@ void PeridynoBridge::RunVapSubstepImpl(float dt_sub, float ghost_time_offset, in
     vap_update_velocity_kernel<<<gsM, bs>>>(
         p.d_vap_pressure, p.d_vap_aii, p.d_vap_is_surface, p.d_vap_merged_vel, p.d_vap_merged_pos,
         p.d_vap_merged_attr, p.d_vap_neighbor_count, p.d_vap_neighbors,
-        p.rest_density, p.h, dt_sub, n_merged);
+        p.rest_density, p.h, dt_sub, p.vap_ghost_vel_scale, n_merged);
 
     vap_clamp_scale_pressure_kernel<<<gsM, bs>>>(
         p.d_vap_pressure, VAP_PRESSURE_ABS_MAX, VAP_PRESSURE_TO_HYDRO, n_merged);
@@ -1708,12 +1922,178 @@ void PeridynoBridge::RunVapSubstepImpl(float dt_sub, float ghost_time_offset, in
     vap_scatter_pressure_back_kernel<<<gsN, bs>>>(p.d_pressures, p.d_vap_pressure, p.d_vap_fluid_to_merged, N);
 }
 
+static void EnsureParentDirectories(const std::string& file_prefix)
+{
+    const size_t slash = file_prefix.find_last_of('/');
+    if (slash == std::string::npos) return;
+    std::string path;
+    for (size_t i = 0; i < slash; ++i) {
+        if (file_prefix[i] == '/') {
+            if (!path.empty()) mkdir(path.c_str(), 0755);
+        }
+        path.push_back(file_prefix[i]);
+    }
+    if (!path.empty()) mkdir(path.c_str(), 0755);
+}
+
+VapBandDiagnosticsSummary PeridynoBridge::ExportVapBandDiagnostics(const std::string& out_prefix) const
+{
+    VapBandDiagnosticsSummary summary;
+    if (!m_impl || !m_initialized) return summary;
+    const auto& p = *m_impl;
+    const int n_band = p.vap_last_n_band;
+    const int G = p.num_ghost_vertices;
+    const int N = p.num_particles;
+    if (n_band <= 0 || N <= 0 || G <= 0 || !p.d_vap_merged_pos || !p.d_grid_particles) return summary;
+
+    const int bs = 256;
+    const int gs_band = (n_band + bs - 1) / bs;
+    const float dt_sub = (p.last_dt_sub > 0.0f) ? p.last_dt_sub : (p.h * 0.01f);
+
+    int* d_n_fluid = nullptr;
+    int* d_n_ghost = nullptr;
+    float* d_ratio = nullptr;
+    float* d_fluid_inf = nullptr;
+    float* d_ghost_inf = nullptr;
+    float* d_fluid_vel_inf = nullptr;
+    float* d_ghost_vel_inf = nullptr;
+    float* d_surf_dist = nullptr;
+    cudaMalloc(&d_n_fluid, n_band * sizeof(int));
+    cudaMalloc(&d_n_ghost, n_band * sizeof(int));
+    cudaMalloc(&d_ratio, n_band * sizeof(float));
+    cudaMalloc(&d_fluid_inf, n_band * sizeof(float));
+    cudaMalloc(&d_ghost_inf, n_band * sizeof(float));
+    cudaMalloc(&d_fluid_vel_inf, n_band * sizeof(float));
+    cudaMalloc(&d_ghost_vel_inf, n_band * sizeof(float));
+    cudaMalloc(&d_surf_dist, G * sizeof(float));
+
+    vap_band_particle_diag_kernel<<<gs_band, bs>>>(
+        n_band, p.d_vap_pressure, p.d_vap_aii, p.d_vap_is_surface, p.d_vap_alpha,
+        p.d_vap_merged_pos, p.d_vap_merged_vel, p.d_vap_merged_nrm, p.d_vap_merged_attr,
+        p.d_vap_neighbor_count, p.d_vap_neighbors, p.h, p.rest_density, dt_sub,
+        VAP_SEPARATION, VAP_TANGENTIAL, p.vap_ghost_div_scale, p.vap_ghost_vel_scale,
+        d_n_fluid, d_n_ghost, d_ratio, d_fluid_inf, d_ghost_inf,
+        d_fluid_vel_inf, d_ghost_vel_inf);
+
+    const float band_h = p.h * VAP_BAND_H_MULT;
+    const float search_dist = fmaxf(band_h * 2.0f, p.h * 4.0f);
+    vap_surface_nearest_fluid_kernel<<<(G + bs - 1) / bs, bs>>>(
+        p.d_ghost_vertices, G, p.d_positions, p.d_grid_particles, p.grid_params,
+        search_dist, d_surf_dist);
+
+    std::vector<int> h_n_fluid(n_band), h_n_ghost(n_band);
+    std::vector<float> h_ratio(n_band), h_fluid_inf(n_band), h_ghost_inf(n_band);
+    std::vector<float> h_fluid_vel_inf(n_band), h_ghost_vel_inf(n_band);
+    std::vector<float> h_surf_dist(G);
+    std::vector<unsigned char> h_band_mask(N);
+    std::vector<int> h_fluid_to_merged(N);
+    cudaMemcpy(h_n_fluid.data(), d_n_fluid, n_band * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_n_ghost.data(), d_n_ghost, n_band * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ratio.data(), d_ratio, n_band * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_fluid_inf.data(), d_fluid_inf, n_band * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ghost_inf.data(), d_ghost_inf, n_band * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_fluid_vel_inf.data(), d_fluid_vel_inf, n_band * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ghost_vel_inf.data(), d_ghost_vel_inf, n_band * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_surf_dist.data(), d_surf_dist, G * sizeof(float), cudaMemcpyDeviceToHost);
+    if (p.d_vap_band_mask)
+        cudaMemcpy(h_band_mask.data(), p.d_vap_band_mask, N * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+    if (p.d_vap_fluid_to_merged)
+        cudaMemcpy(h_fluid_to_merged.data(), p.d_vap_fluid_to_merged, N * sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_n_fluid);
+    cudaFree(d_n_ghost);
+    cudaFree(d_ratio);
+    cudaFree(d_fluid_inf);
+    cudaFree(d_ghost_inf);
+    cudaFree(d_fluid_vel_inf);
+    cudaFree(d_ghost_vel_inf);
+    cudaFree(d_surf_dist);
+
+    int n_mask = 0;
+    for (unsigned char m : h_band_mask) if (m) ++n_mask;
+
+    std::vector<int> merged_to_fluid(n_band, -1);
+    for (int fi = 0; fi < N; ++fi) {
+        const int slot = h_fluid_to_merged[fi];
+        if (slot >= 0 && slot < n_band) merged_to_fluid[slot] = fi;
+    }
+
+    double sum_ratio = 0.0, sum_fluid_inf = 0.0, sum_ghost_inf = 0.0;
+    double sum_fluid_vel_inf = 0.0, sum_ghost_vel_inf = 0.0, sum_surf_dist = 0.0;
+    for (int i = 0; i < n_band; ++i) {
+        sum_ratio += h_ratio[i];
+        sum_fluid_inf += h_fluid_inf[i];
+        sum_ghost_inf += h_ghost_inf[i];
+        sum_fluid_vel_inf += h_fluid_vel_inf[i];
+        sum_ghost_vel_inf += h_ghost_vel_inf[i];
+    }
+    for (float d : h_surf_dist) sum_surf_dist += d;
+
+    summary.n_band_fluid = n_band;
+    summary.n_band_mask_fluid = n_mask;
+    summary.avg_ghost_fluid_neighbor_ratio = sum_ratio / std::max(n_band, 1);
+    summary.avg_surface_nearest_fluid_dist = sum_surf_dist / std::max(G, 1);
+    summary.avg_fluid_influence = sum_fluid_vel_inf / std::max(n_band, 1);
+    summary.avg_ghost_influence = sum_ghost_vel_inf / std::max(n_band, 1);
+    summary.ghost_influence_fraction =
+        sum_ghost_vel_inf / std::max(sum_fluid_vel_inf + sum_ghost_vel_inf, 1e-12);
+    summary.valid = true;
+
+    EnsureParentDirectories(out_prefix);
+
+    const std::string particles_path = out_prefix + "_band_particles.csv";
+    const std::string summary_path = out_prefix + "_band_summary.txt";
+    {
+        std::vector<float> h_mpos(3 * n_band), h_mvel(3 * n_band), h_press(n_band);
+        cudaMemcpy(h_mpos.data(), p.d_vap_merged_pos, n_band * sizeof(float3), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mvel.data(), p.d_vap_merged_vel, n_band * sizeof(float3), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_press.data(), p.d_vap_pressure, n_band * sizeof(float), cudaMemcpyDeviceToHost);
+
+        std::ofstream csv(particles_path);
+        csv << std::fixed << std::setprecision(8);
+        csv << "merged_idx,orig_fluid_idx,pos_x,pos_y,pos_z,vel_x,vel_y,vel_z,pressure,"
+               "n_fluid_nbr,n_ghost_nbr,ghost_fluid_ratio,"
+               "fluid_influence_total,ghost_influence_total,fluid_vel_influence,ghost_vel_influence\n";
+        for (int i = 0; i < n_band; ++i) {
+            const float3& mp = reinterpret_cast<const float3*>(h_mpos.data())[i];
+            const float3& mv = reinterpret_cast<const float3*>(h_mvel.data())[i];
+            csv << i << ',' << merged_to_fluid[i] << ','
+                << mp.x << ',' << mp.y << ',' << mp.z << ','
+                << mv.x << ',' << mv.y << ',' << mv.z << ','
+                << h_press[i] << ','
+                << h_n_fluid[i] << ',' << h_n_ghost[i] << ','
+                << h_ratio[i] << ','
+                << h_fluid_inf[i] << ',' << h_ghost_inf[i] << ','
+                << h_fluid_vel_inf[i] << ',' << h_ghost_vel_inf[i] << '\n';
+        }
+    }
+    {
+        std::ofstream out(summary_path);
+        out << std::fixed << std::setprecision(8);
+        out << "VAP_GHOST_DIAG_COEFF=" << VAP_GHOST_DIAG_COEFF << '\n';
+        out << "ghost_div_scale=" << p.vap_ghost_div_scale << '\n';
+        out << "ghost_vel_scale=" << p.vap_ghost_vel_scale << '\n';
+        out << "band_h=" << band_h << " h=" << p.h << " dt_sub=" << dt_sub << '\n';
+        out << "n_band_fluid=" << n_band << '\n';
+        out << "n_band_mask_fluid=" << n_mask << '\n';
+        out << "avg_ghost_fluid_neighbor_ratio=" << summary.avg_ghost_fluid_neighbor_ratio << '\n';
+        out << "avg_surface_nearest_fluid_dist=" << summary.avg_surface_nearest_fluid_dist << '\n';
+        out << "avg_fluid_vel_influence=" << summary.avg_fluid_influence << '\n';
+        out << "avg_ghost_vel_influence=" << summary.avg_ghost_influence << '\n';
+        out << "ghost_vel_influence_fraction=" << summary.ghost_influence_fraction << '\n';
+        out << "avg_fluid_influence_total=" << (sum_fluid_inf / std::max(n_band, 1)) << '\n';
+        out << "avg_ghost_influence_total=" << (sum_ghost_inf / std::max(n_band, 1)) << '\n';
+        out << "particles_csv=" << particles_path << '\n';
+    }
+    return summary;
+}
+
 /**
  * 上传 FEM 鱼体边界（每 FEM 帧调用一次）
  *
  * @param surface_vertices   全部 FEM 顶点位置 (3×N)，double→float H2D
  * @param surface_velocities 对应顶点速度
- * @param surface_faces      表面三角面索引 (14284 个面)
+ * @param surface_faces      表面三角面索引；VAP ghost 仅使用面上的顶点子集
  *
  * 拓扑变化时：分配 GPU 缓冲、上传面索引、预计算初始面积
  * 每帧：上传最新顶点位置/速度供 FSI 使用
@@ -1812,9 +2192,23 @@ void PeridynoBridge::SetFishBoundary(
         cudaMalloc(&p.d_face_grid_particles, fcells * MAX_FACES_PER_CELL * sizeof(int));
         p.face_grid_allocated = true;
         RebuildSurfaceAdjacency(nv, surface_faces);
+        RebuildGhostVertexList(nv);
+        EnsureGhostGpuBuffers();
+        std::cout << "[PeridynoBridge] VAP ghost: " << p.num_ghost_vertices
+                  << "/" << m_ghost_surface_full_count
+                  << " surface (stride=" << m_ghost_sample_stride
+                  << ", FEM nv=" << nv << ")" << std::endl;
     }
-    if (m_on_surface.empty() && nf > 0)
+    if (vertices_changed && nf > 0 && !faces_changed) {
         RebuildSurfaceAdjacency(nv, surface_faces);
+        RebuildGhostVertexList(nv);
+        EnsureGhostGpuBuffers();
+    }
+    if (m_on_surface.empty() && nf > 0) {
+        RebuildSurfaceAdjacency(nv, surface_faces);
+        RebuildGhostVertexList(nv);
+        EnsureGhostGpuBuffers();
+    }
 
     // ---- 上传顶点位置和速度（每帧）----
     std::vector<float3> cpu_v(nv), cpu_vel(nv);
@@ -1825,9 +2219,15 @@ void PeridynoBridge::SetFishBoundary(
     cudaMemcpy(p.d_boundary_vertices,   cpu_v.data(),   nv * sizeof(float3), cudaMemcpyHostToDevice);
     cudaMemcpy(p.d_boundary_velocities, cpu_vel.data(), nv * sizeof(float3), cudaMemcpyHostToDevice);
 
-    if (p.d_boundary_normals && nf > 0) {
-        std::vector<float3> vtx_nrm = ComputeVertexNormals(nv, surface_vertices, surface_faces);
-        cudaMemcpy(p.d_boundary_normals, vtx_nrm.data(), nv * sizeof(float3), cudaMemcpyHostToDevice);
+    if (p.d_boundary_normals && nf > 0 && p.d_face_indices) {
+        const int bs = 256;
+        const int vgs = (nv + bs - 1) / bs;
+        const int fgs = (nf + bs - 1) / bs;
+        clear_float3_kernel<<<vgs, bs>>>(p.d_boundary_normals, nv);
+        accumulate_vertex_normals_kernel<<<fgs, bs>>>(
+            p.d_boundary_vertices, p.d_face_indices, p.d_boundary_normals, nf);
+        normalize_vertex_normals_kernel<<<vgs, bs>>>(p.d_boundary_normals, nv);
+        GatherGhostBoundaryData();
     }
 
     m_last_fsi_snapshot.positions = surface_vertices;
@@ -1857,6 +2257,7 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
 
     int n_substeps = p.n_substeps;
     float dt_sub   = dt / (float)n_substeps;
+    p.last_dt_sub = dt_sub;
 
     // ---- 更新三角面数据（每帧一次）----
     if (p.num_faces > 0) {
@@ -1891,9 +2292,9 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
     const bool use_vap_hydro = false;
 #endif
     const float mass_inv = 1.0f / (p.mass + 1e-6f);
-    const bool vap_hybrid_sph = use_vap_hydro && p.num_faces > 0 && p.num_boundary_vertices > 0;
+    const bool vap_hybrid_sph = use_vap_hydro && p.num_faces > 0 && p.num_ghost_vertices > 0;
     if (vap_hybrid_sph)
-        EnsureVapGpuCapacity(N, p.num_boundary_vertices);
+        EnsureVapGpuCapacity(N, p.num_ghost_vertices);
 
     for (int sub = 0; sub < n_substeps; sub++) {
         clear_forces_kernel<<<gs, bs>>>(p.d_forces, N);
@@ -1930,7 +2331,7 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
 
             cudaMemset(p.d_pressures, 0, N * sizeof(float));
             const float ghost_t = (float)sub * dt_sub;
-            RunVapSubstepImpl(dt_sub, ghost_t, bs);
+            RunVapSubstepImpl(dt_sub, ghost_t, bs, vap_hybrid_sph && p.d_vap_band_mask != nullptr);
         } else {
             compute_sph_forces_kernel<<<gs, bs>>>(
                 p.d_positions, p.d_velocities,
@@ -2012,7 +2413,7 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
             ramped_flow, 0.5f, p.h * 0.5f, N);
 
         apply_ramped_flow_kernel<<<gs, bs>>>(
-            p.d_velocities, ramped_flow, ramp, N);
+            p.d_velocities, ramped_flow, ramp, p.d_vap_band_mask, N);
 
         if (use_vap_hydro) {
             integrate_position_kernel<<<gs, bs>>>(p.d_positions, p.d_velocities, dt_sub, N);
@@ -2038,7 +2439,7 @@ Eigen::VectorXd PeridynoBridge::ComputeFluidForces(float dt)
                    p.num_boundary_vertices * sizeof(float3), cudaMemcpyDeviceToHost);
 
         const float avg_scale = 1.0f / static_cast<float>(n_substeps);
-        const float force_scale = p.last_ramp;
+        const float force_scale = 1.0f;
 
         const int nv = p.num_boundary_vertices;
         m_last_fsi_snapshot.contact.resize(3 * nv);
