@@ -56,6 +56,41 @@ struct VapBandDiagnosticsSummary {
     bool valid = false;
 };
 
+/** 单个被追踪流体粒子在最近一次 ComputeFluidForces 后的 VAP/WCSPH 状态 */
+struct VapTraceParticleRecord {
+    int step = 0;
+    double sim_t = 0.0;
+    int trace_slot = -1;
+    int fluid_id = -1;
+    int in_band = 0;
+    int merged_idx = -1;
+    int n_band_fluid = 0;
+
+    float pos_x = 0, pos_y = 0, pos_z = 0;
+    float vel_x = 0, vel_y = 0, vel_z = 0;
+    float density = 0;
+    float wcsph_pressure = 0;
+    float wcsph_force_x = 0, wcsph_force_y = 0, wcsph_force_z = 0;
+
+    float merged_pos_x = 0, merged_pos_y = 0, merged_pos_z = 0;
+    float merged_vel_x = 0, merged_vel_y = 0, merged_vel_z = 0;
+    int merged_attr = -1;
+    int n_fluid_nbr = 0;
+    int n_ghost_nbr = 0;
+    int is_surface = 0;
+    float alpha = 0;
+    float aii = 0;
+    float aii_fluid = 0;
+    float aii_total = 0;
+    float b_divergence = 0;
+    float p_initial = 0;
+    float p_raw_solution = 0;
+    float p_hydro_scaled = 0;
+    float ax_final = 0;
+    float residual_final = 0;
+    float cg_search_p_final = 0;
+};
+
 class PeridynoBridge
 {
 public:
@@ -100,6 +135,10 @@ public:
     void SetHydroForceScale(float scale);
     float GetHydroForceScale() const { return m_hydro_force_scale; }
 
+    // 去除离散 VAP 压力采样造成的全局横向(x/y)净力偏置；1=完全扣除，0=关闭。
+    void SetHydroTransverseForceProjection(float strength);
+    float GetHydroTransverseForceProjection() const { return m_hydro_transverse_force_projection; }
+
     // 运行时开关：接触排斥 / 水压力积分（需编译期对应 ENABLE_* 为 1 才生效）
     void SetEnableContactRepulsion(bool enable);
     bool GetEnableContactRepulsion() const { return m_enable_contact_repulsion; }
@@ -132,6 +171,17 @@ public:
     /** 导出当前 GPU 上 VAP merged 状态（须在 ComputeFluidForces 之后调用） */
     VapBandDiagnosticsSummary ExportVapBandDiagnostics(const std::string& out_prefix) const;
 
+    /** 从当前 VAP band 中按 z 向分布挑选若干流体粒子，用于后续逐帧追踪 */
+    std::vector<int> SelectVapBandTraceParticles(int max_particles) const;
+
+    /** 导出指定 fluid_id 在最近一次 ComputeFluidForces 后的逐粒子诊断 CSV */
+    bool ExportVapTraceParticlesCsv(
+        const std::string& csv_path,
+        const std::vector<int>& fluid_ids,
+        int step,
+        double sim_t,
+        bool append) const;
+
     bool IsInitialized() const { return m_initialized; }
     int  GetFluidParticleCount() const;
     void GetFluidParticles(std::vector<float>& positions) const;
@@ -148,6 +198,10 @@ public:
     void SetVapGhostCouplingScales(float divergence_scale, float velocity_penalty_scale);
     float GetVapGhostDivergenceScale() const { return m_vap_ghost_div_scale; }
     float GetVapGhostVelocityPenaltyScale() const { return m_vap_ghost_vel_scale; }
+
+    /** true：当前粒子域全部走 VAP，不做窄带 / band 内外 WCSPH 区分 */
+    void SetVapFullDomain(bool enable) { m_vap_full_domain = enable; }
+    bool GetVapFullDomain() const { return m_vap_full_domain; }
 
 private:
     void InitFluidParticles();
@@ -178,6 +232,7 @@ private:
     float m_contact_damping = 2.0f;
     float m_flow_ramp_time = 0.5f;
     float m_hydro_force_scale = 1.0f;
+    float m_hydro_transverse_force_projection = 0.0f;
     float m_max_vertex_force = 0.0f;
     bool m_enable_contact_repulsion = true;
     bool m_enable_hydro_pressure = true;
@@ -194,6 +249,7 @@ private:
     int m_ghost_surface_full_count = 0;
     float m_vap_ghost_div_scale = 1.0f;
     float m_vap_ghost_vel_scale = 1.0f;
+    bool m_vap_full_domain = false;
 
     // 表面拓扑：用于零水压顶点的邻域插值；m_ghost_vertex_indices 为 VAP ghost 紧凑索引
     std::vector<int> m_ghost_vertex_indices;

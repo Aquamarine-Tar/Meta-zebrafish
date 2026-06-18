@@ -64,7 +64,7 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
     // 初始化 GPU SPH 流体求解器（域以鱼体 AABB 中心为心，尺寸随鱼体缩放）
     mFluidBridge = new PeridynoBridge();
     float particle_spacing = 0.011f;  // 粒子分辨率，鱼体横向约 13 个粒子
-    Eigen::Vector3d flow_velocity(0, 0, -0.05);  // 流速
+    Eigen::Vector3d flow_velocity(0, 0, 0);  // 自推进基线：避免 1.5s 内鱼体被背景流带出粒子域
     Eigen::Vector3d fish_min = mCreature->GetMeshBBMin();
     Eigen::Vector3d fish_max = mCreature->GetMeshBBMax();
     const Eigen::Vector3d fish_center = 0.5 * (fish_min + fish_max);
@@ -81,12 +81,15 @@ Environment::Environment(const std::string& model_meta_file, bool enable_key_wor
                              0.05f,
                              mSoftWorld->GetPositions(),
                              mCreature->GetContours());
-    // FSI 扫参（ramp=0.1, 0.5–1s: vol≈0.95, inverted≤6 @ combo sub18+Δx0.011）
+    // FSI/VAP 可视化默认运行档：回到 ghost_coupling_sweep_postfix/div0p25_vel0p25
+    // 中表现出明显来流响应的参数组。
     mFluidBridge->SetSubsteps(18);
     mFluidBridge->SetContactParams(0.3f, 15.0f);
-    mFluidBridge->SetFlowRampTime(1.0f);
-    mFluidBridge->SetHydroForceScale(1.0f);  // 渐进恢复水压力积分（细扫: vol≈0.96, inverted=13）
+    mFluidBridge->SetFlowRampTime(0.1f);
+    mFluidBridge->SetHydroForceScale(1.0f);
+    mFluidBridge->SetHydroTransverseForceProjection(0.0f);
     mFluidBridge->SetMaxVertexForce(5.0f);    // 顶点力上限 (N)
+    mFluidBridge->SetVapGhostCouplingScales(0.25f, 0.25f);
     mFluidBridge->SetEnableContactRepulsion(false);  // 关闭接触斥力
     std::cout << "[Environment] GPU SPH solver initialized." << std::endl;
     std::cout << "[Environment] Fluid domain (fish-centered): "
@@ -324,6 +327,8 @@ void Environment::Reset()
     }
 
     mSoftWorld->Reset();
+    if (mFluidBridge != nullptr)
+        mFluidBridge->Reset();
     if (mKeyCreature != nullptr)
         mKeyCreature->Reset();
     mPhase = 0;

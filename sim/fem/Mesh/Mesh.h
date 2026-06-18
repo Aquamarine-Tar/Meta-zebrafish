@@ -13,11 +13,12 @@ public:
 	virtual const std::vector<Eigen::Vector3d>& GetVertices(){return mVertices;};
 	virtual const std::vector<Eigen::Vector3i>& GetTriangles(){return mTriangles;};
 	virtual const std::vector<Eigen::Vector4i>& GetTetrahedrons(){return mTetrahedrons;};
+	virtual const std::vector<int>& GetTetrahedronLabels(){return mTetrahedronLabels;};
 	virtual const std::vector<Eigen::Vector3d>& GetVertexNormal() {return mVerticesNormal;};
 	virtual const std::vector<Eigen::Vector2d>& GetTextureCoord() {return mTextureCoord;};
 	virtual const std::vector<Eigen::Vector3i>& GetFaceNormal() {return mFacesNormal;};
 	virtual const std::vector<Eigen::Vector3i>& GetFaceTexture() {return mFacesTexture;};
-	virtual void Clear() {mVertices.clear(); mTetrahedrons.clear();};
+	virtual void Clear() {mVertices.clear(); mTetrahedrons.clear(); mTetrahedronLabels.clear();};
 	const Eigen::Vector3d& GetBBMin() const { return mBBMin; }
 	const Eigen::Vector3d& GetBBMax() const { return mBBMax; }
 
@@ -25,6 +26,7 @@ protected:
 	std::vector<Eigen::Vector3d> mVertices;
 	std::vector<Eigen::Vector3i> mTriangles;
 	std::vector<Eigen::Vector4i> mTetrahedrons;
+	std::vector<int> mTetrahedronLabels;
 	std::vector<Eigen::Vector3d> mVerticesNormal;
 	std::vector<Eigen::Vector2d> mTextureCoord;
 	std::vector<Eigen::Vector3i> mFacesNormal;

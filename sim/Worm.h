@@ -76,6 +76,9 @@ public:
 	bool IsEndEffector(int idx);
 
 private:
+	double GetYoungsModulusForTet(int tet_index) const;
+	void LogTetMaterialSummary() const;
+
 	double 									mMuscleStiffness;
 	double 									mYoungsModulus;
 	double									mPoissonRatio;

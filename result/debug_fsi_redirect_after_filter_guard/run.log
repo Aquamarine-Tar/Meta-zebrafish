@@ -1,0 +1,41 @@
++ Meta Data Path: /home/huangyunhao/workspace/Metaworm_peridyno/data/fish.meta
+  Reading MeditMesh /home/huangyunhao/workspace/Metaworm_peridyno/data/fish_body.mesh ...  Successed! AABB: [0.00581743 0.00710448 0.0096326] [0.14032 0.129629 0.522836] Size: [0.134503 0.122524 0.513203]
+  Reading Muscle hyp_L...  Successed!   length: 973  MaxMinAvg: 0.000493885 8.13604e-05 0.000274145
+  Reading Muscle hyp_R...  Successed!   length: 289  MaxMinAvg: 0.00181068 0.000162077 0.000928413
+  Reading Muscle ep_L...  Successed!   length: 241  MaxMinAvg: 0.00196112 0.00017294 0.00108553
+  Reading Muscle ep_R...  Successed!   length: 100  MaxMinAvg: 0.00264821 0.00264604 0.00264818
+  Computing center of mass ...  7211 Done
+  Computing center index ...  71 Done
+  Init Worm...  FEM material regions:
+    label 0 tets=13108 youngs_modulus=200000
+    label 1 tets=11568 youngs_modulus=400000
+ Vertices: 7950 Triangles: 98704 Tets: 24676 Countours: 14284 Constraints: 28718
+               Volume: 0.00201391 Surface Area: 0.127029 Mass: 10
+Total degree of freedom : 23850
+Total constraints : 28718
+OpenMP max threads: 32
+[PeridynoBridge] warn: init particle filter attempt 1 failed: launch=CUDA driver version is insufficient for CUDA runtime version sync=CUDA driver version is insufficient for CUDA runtime version
+[PeridynoBridge] warn: init particle filter attempt 2 failed: launch=CUDA driver version is insufficient for CUDA runtime version sync=CUDA driver version is insufficient for CUDA runtime version
+[PeridynoBridge] warn: init particle filter attempt 3 failed: launch=CUDA driver version is insufficient for CUDA runtime version sync=CUDA driver version is insufficient for CUDA runtime version
+[PeridynoBridge] warn: keeping unfiltered initial particles after repeated filter failures
+[PeridynoBridge] warn: init particle filter attempt 1 failed: launch=CUDA driver version is insufficient for CUDA runtime version sync=CUDA driver version is insufficient for CUDA runtime version
+[PeridynoBridge] warn: init particle filter attempt 2 failed: launch=CUDA driver version is insufficient for CUDA runtime version sync=CUDA driver version is insufficient for CUDA runtime version
+[PeridynoBridge] warn: init particle filter attempt 3 failed: launch=CUDA driver version is insufficient for CUDA runtime version sync=CUDA driver version is insufficient for CUDA runtime version
+[PeridynoBridge] warn: keeping unfiltered initial particles after repeated filter failures
+[PeridynoBridge] Added 6317 initial boundary-layer fluid particles at 0.011 m from fish surface
+[PeridynoBridge] Initialized: 103701 fluid particles, spacing=0.011, h=0.022, domain  -0.126931 -0.0816333  -0.246969 to 0.273069 0.218367 0.779437
+  substeps=4 contact(stiffness=10 damping=2) vap_hydro=on
+[Environment] GPU SPH solver initialized.
+[Environment] Fluid domain (fish-centered):  -0.126931 -0.0816333  -0.246969 to 0.273069 0.218367 0.779437  fish_center=0.0730689 0.0683667  0.266234  domain_half=     0.2     0.15 0.513203  fish_size=0.134503 0.122524 0.513203
+Avg Coord Velocity: [0, 0, 0]  0  Target Velocity: [0.131718, 0.223733, -0.00116887]  0.259629
+=== FSI snapshot ===
+seconds=0.01 sim_hz=480 t=[0.01,0.01] step=0.5 max_force=5 ramp_sec=0.5 hydro_scale=0.1 flow=(0,0,0) ghost_stride=1 ghost_div_scale=0.02 ghost_vel_scale=0.05 substeps=18 dx=0.011 torque_only=0
+[PeridynoBridge] Boundary: 7950 vertices
+[PeridynoBridge] Faces: 14284 triangles, total surface area=0.127029 m^2
+[PeridynoBridge] VAP ghost: 1270/7144 surface (stride=1, spacing_scale=1, FEM nv=7950)
+[FEM] PD iter=13 eval_ms=62.8813 solve_ms=136.067
+[2026-06-18 18:00:25.472] [WARN FEM t=0.0021s iter=1 sph_ms=1.62 fem_ms=199.63 step_ms=201.29] volume_ratio=0.999440 tet_ratio=[0.5894, 1.3800] inverted=0 total_vol=2.012777e-03 m^3 | FSI(1s n=0): contact_avg=0.00 N peak=0.0000 N, hydro_avg=0.00 N peak=0.0000 N
+SUMMARY sim_time=0.00833333 avg_step_ms=146.826 last_step_ms=106.832 max_step_ms=201.506 final_vol=0.996128 final_inverted=0 com_disp=(-4.57967e-16,-7.21645e-16,-1.38778e-16) ub_disp=(-9.57115e-08,3.3988e-07,-8.12787e-08) com_disp_z=-1.38778e-16 ub_disp_z=-8.12787e-08 hydro_nonzero_surf=0/7144 hydro_nonzero_pct=0 ghost_stride=1 flow=(0,0,0)
+done. summary -> result/debug_fsi_redirect_after_filter_guard/torque_summary.csv
+displacement -> result/debug_fsi_redirect_after_filter_guard/displacement_summary.txt
+metrics -> result/debug_fsi_redirect_after_filter_guard/metrics.txt

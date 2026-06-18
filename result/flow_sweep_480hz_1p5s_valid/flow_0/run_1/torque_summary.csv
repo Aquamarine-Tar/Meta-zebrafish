@@ -1,0 +1,4 @@
+sim_time,iter,tau_x_surface_com,tau_x_surface_center,tau_x_all_com,force_sum_x,force_sum_y,force_sum_z,ramp
+0.5,240,0.662052,1.46957,0.662052,-9.06884,-4.5361,7.75333,1
+1,480,0,0,0,0,0,0,1
+1.5,720,0,0,0,0,0,0,1

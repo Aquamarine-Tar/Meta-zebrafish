@@ -7,6 +7,7 @@
 #include "Environment.h"
 #include "Worm.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -267,14 +268,18 @@ int main(int argc, char** argv)
     double t_step = 0.25;
     float max_force = 5.0f;
     float ramp_sec = 0.1f;
+    float hydro_scale = 1.0f;
+    float hydro_transverse_projection = 0.0f;
     int sim_hz_arg = 960;
     int substeps_override = -1;
     int ghost_stride = 1;
+    float ghost_div_scale = 0.25f;
+    float ghost_vel_scale = 0.25f;
     bool torque_only = false;
     bool flow_override = false;
     float flow_vx = 0.0f;
     float flow_vy = 0.0f;
-    float flow_vz = -0.05f;
+    float flow_vz = 0.0f;
     for (int i = 1; i < argc; ++i)
     {
         std::string k = argv[i];
@@ -284,10 +289,14 @@ int main(int argc, char** argv)
         else if (i + 1 < argc && k == "--t-start") { t_start = std::atof(argv[++i]); }
         else if (i + 1 < argc && k == "--t-step") { t_step = std::atof(argv[++i]); }
         else if (i + 1 < argc && k == "--max-force") { max_force = std::atof(argv[++i]); }
+        else if (i + 1 < argc && k == "--hydro-scale") { hydro_scale = std::atof(argv[++i]); }
+        else if (i + 1 < argc && k == "--hydro-transverse-projection") { hydro_transverse_projection = std::atof(argv[++i]); }
         else if (i + 1 < argc && k == "--ramp") { ramp_sec = std::atof(argv[++i]); }
         else if (i + 1 < argc && k == "--sim-hz") { sim_hz_arg = std::atoi(argv[++i]); }
         else if (i + 1 < argc && k == "--substeps") { substeps_override = std::atoi(argv[++i]); }
         else if (i + 1 < argc && k == "--ghost-stride") { ghost_stride = std::atoi(argv[++i]); }
+        else if (i + 1 < argc && k == "--ghost-div-scale") { ghost_div_scale = std::atof(argv[++i]); }
+        else if (i + 1 < argc && k == "--ghost-vel-scale") { ghost_vel_scale = std::atof(argv[++i]); }
         else if (i + 1 < argc && k == "--flow")
         {
             if (!ParseFlowTriple(argv[++i], flow_vx, flow_vy, flow_vz))
@@ -316,9 +325,11 @@ int main(int argc, char** argv)
     if (flow_override)
         bridge->SetFlowVelocity(Eigen::Vector3d(flow_vx, flow_vy, flow_vz));
     bridge->SetGhostSampleStride(ghost_stride);
+    bridge->SetVapGhostCouplingScales(ghost_div_scale, ghost_vel_scale);
     bridge->SetContactParams(0.3f, 15.0f);
     bridge->SetFlowRampTime(ramp_sec);
-    bridge->SetHydroForceScale(1.0f);
+    bridge->SetHydroForceScale(hydro_scale);
+    bridge->SetHydroTransverseForceProjection(hydro_transverse_projection);
     bridge->SetMaxVertexForce(max_force);
     bridge->SetEnableContactRepulsion(false);
     bridge->SetEnableHydroPressure(true);
@@ -348,13 +359,20 @@ int main(int argc, char** argv)
     const Eigen::Vector3d flow_vel = bridge->GetFlowVelocity();
     const Eigen::Vector3d com0 = ComputeCom(env.GetSoftWorld()->GetPositions());
     const Eigen::Vector3d ub0 = ComputeUnbiasedTranslation(env.GetCreature(), env.GetSoftWorld()->GetPositions());
+    double sum_step_ms = 0.0;
+    double last_step_ms = 0.0;
+    double max_step_ms = 0.0;
 
     std::cout << "=== FSI snapshot ===\n"
               << "seconds=" << seconds << " sim_hz=" << sim_hz
               << " t=[" << t_start << "," << seconds << "] step=" << t_step
               << " max_force=" << max_force << " ramp_sec=" << ramp_sec
+              << " hydro_scale=" << hydro_scale
+              << " hydro_transverse_projection=" << bridge->GetHydroTransverseForceProjection()
               << " flow=(" << flow_vel.x() << "," << flow_vel.y() << "," << flow_vel.z() << ")"
               << " ghost_stride=" << ghost_stride
+              << " ghost_div_scale=" << ghost_div_scale
+              << " ghost_vel_scale=" << ghost_vel_scale
               << " substeps=" << bridge->GetSubsteps()
               << " dx=" << bridge->GetParticleSpacing()
               << " torque_only=" << (torque_only ? 1 : 0) << '\n';
@@ -368,7 +386,12 @@ int main(int argc, char** argv)
             env.SetPhase(step / ratio);
         }
 
+        auto step_t0 = std::chrono::high_resolution_clock::now();
         env.Step();
+        auto step_t1 = std::chrono::high_resolution_clock::now();
+        last_step_ms = std::chrono::duration<double, std::milli>(step_t1 - step_t0).count();
+        sum_step_ms += last_step_ms;
+        max_step_ms = std::max(max_step_ms, last_step_ms);
         const int iter = step + 1;
         const double sim_t = IterToTime(iter, sim_hz);
 
@@ -468,9 +491,36 @@ int main(int argc, char** argv)
     }
     const int surf_n = (int)surface_vertices.size();
     const double hydro_nonzero_pct = 100.0 * hydro_nonzero / std::max(surf_n, 1);
+    const double avg_step_ms = sum_step_ms / std::max(total_steps, 1);
+
+    const std::string metrics_path = out_dir + "/metrics.txt";
+    {
+        std::ofstream metrics(metrics_path);
+        metrics << std::setprecision(10);
+        metrics << "sim_time=" << sim_t_final << '\n';
+        metrics << "avg_step_ms=" << avg_step_ms << '\n';
+        metrics << "last_step_ms=" << last_step_ms << '\n';
+        metrics << "max_step_ms=" << max_step_ms << '\n';
+        metrics << "final_vol=" << vol.volume_ratio << '\n';
+        metrics << "vol_shrink_pct=" << ((1.0 - vol.volume_ratio) * 100.0) << '\n';
+        metrics << "final_inverted=" << vol.inverted_tets << '\n';
+        metrics << "com_disp=" << com_disp.transpose() << '\n';
+        metrics << "com_disp_z=" << com_disp.z() << '\n';
+        metrics << "ub_disp=" << ub_disp.transpose() << '\n';
+        metrics << "ub_disp_z=" << ub_disp.z() << '\n';
+        metrics << "hydro_nonzero_surf=" << hydro_nonzero << '\n';
+        metrics << "hydro_surface_total=" << surf_n << '\n';
+        metrics << "hydro_nonzero_pct=" << hydro_nonzero_pct << '\n';
+        metrics << "ghost_stride=" << ghost_stride << '\n';
+        metrics << "flow=" << flow_vel.transpose() << '\n';
+        metrics << "hydro_transverse_projection=" << bridge->GetHydroTransverseForceProjection() << '\n';
+    }
 
     std::cout << std::setprecision(6);
     std::cout << "SUMMARY sim_time=" << sim_t_final
+              << " avg_step_ms=" << avg_step_ms
+              << " last_step_ms=" << last_step_ms
+              << " max_step_ms=" << max_step_ms
               << " final_vol=" << vol.volume_ratio
               << " final_inverted=" << vol.inverted_tets
               << " com_disp=(" << com_disp.x() << "," << com_disp.y() << "," << com_disp.z() << ")"
@@ -483,5 +533,6 @@ int main(int argc, char** argv)
               << " flow=(" << flow_vel.x() << "," << flow_vel.y() << "," << flow_vel.z() << ")\n";
     std::cout << "done. summary -> " << summary_path << '\n';
     std::cout << "displacement -> " << disp_path << '\n';
+    std::cout << "metrics -> " << metrics_path << '\n';
     return 0;
 }

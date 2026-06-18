@@ -5,6 +5,7 @@
 
 #include <fstream>
 #include <iomanip>
+#include <map>
 
 #define LOCAL 0
 #define GLOBAL 1
@@ -27,6 +28,40 @@ double SignedTetVolume(const Eigen::VectorXd &x, const Eigen::Vector4i &tet)
 	return (p1 - p0).cross(p2 - p0).dot(p3 - p0) / 6.0;
 }
 } // namespace
+
+double Worm::GetYoungsModulusForTet(int tet_index) const
+{
+	const auto &tet_labels = mMesh->GetTetrahedronLabels();
+	if (tet_index >= 0 && tet_index < (int)tet_labels.size() && tet_labels[tet_index] == 1)
+		return 4E5;
+	return mYoungsModulus;
+}
+
+void Worm::LogTetMaterialSummary() const
+{
+	const auto &tets = mMesh->GetTetrahedrons();
+	const auto &tet_labels = mMesh->GetTetrahedronLabels();
+	std::map<int, int> counts;
+	std::map<int, double> youngs_by_label;
+
+	for (int i = 0; i < (int)tets.size(); ++i)
+	{
+		int label = 0;
+		if (i < (int)tet_labels.size())
+			label = tet_labels[i];
+		counts[label]++;
+		youngs_by_label[label] = GetYoungsModulusForTet(i);
+	}
+
+	std::cout << "  FEM material regions:" << std::endl;
+	for (const auto &kv : counts)
+	{
+		std::cout << "    label " << kv.first
+		          << " tets=" << kv.second
+		          << " youngs_modulus=" << youngs_by_label[kv.first]
+		          << std::endl;
+	}
+}
 
 VolumeStats Worm::ComputeVolumeStats(const Eigen::VectorXd &x) const
 {
@@ -235,14 +270,16 @@ void Worm::Initialize(FEM::World *world, bool load_driven_signals)
 
 	const auto &vertices = mMesh->GetVertices();
 	const auto &tetrahedras = mMesh->GetTetrahedrons();
+	LogTetMaterialSummary();
 
 	std::vector<Eigen::Vector3i> triangles;
 	std::vector<std::pair<Eigen::Vector3i, int>> surfaces;
 
 	double total_volume = 0;
 	double volume = 0;
-	for (const auto &tet : tetrahedras)
+	for (int tet_index = 0; tet_index < (int)tetrahedras.size(); ++tet_index)
 	{
+		const auto &tet = tetrahedras[tet_index];
 		int i0, i1, i2, i3;
 		Eigen::Vector3d p0, p1, p2, p3;
 
@@ -276,7 +313,7 @@ void Worm::Initialize(FEM::World *world, bool load_driven_signals)
 		}
 		volume = 1.0 / 6.0 * (Dm.determinant());
 		total_volume += volume;
-		mConstraints.push_back(new CorotateFEMConstraint(mYoungsModulus, mPoissonRatio, i0, i1, i2, i3, volume, Dm.inverse()));
+		mConstraints.push_back(new CorotateFEMConstraint(GetYoungsModulusForTet(tet_index), mPoissonRatio, i0, i1, i2, i3, volume, Dm.inverse()));
 		int sorted_idx[4] = {i0, i1, i2, i3};
 		std::sort(sorted_idx, sorted_idx + 4);
 		triangles.push_back(Eigen::Vector3i(sorted_idx[0], sorted_idx[1], sorted_idx[2]));

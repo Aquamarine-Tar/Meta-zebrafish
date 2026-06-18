@@ -1,0 +1,49 @@
++ Meta Data Path: /home/huangyunhao/workspace/Metaworm_peridyno/data/fish.meta
+  Reading MeditMesh /home/huangyunhao/workspace/Metaworm_peridyno/data/fish_body.mesh ...  Successed! AABB: [0.00581743 0.00710448 0.0096326] [0.14032 0.129629 0.522836] Size: [0.134503 0.122524 0.513203]
+  Reading Muscle hyp_L...  Successed!   length: 973  MaxMinAvg: 0.000493885 8.13604e-05 0.000274145
+  Reading Muscle hyp_R...  Successed!   length: 289  MaxMinAvg: 0.00181068 0.000162077 0.000928413
+  Reading Muscle ep_L...  Successed!   length: 241  MaxMinAvg: 0.00196112 0.00017294 0.00108553
+  Reading Muscle ep_R...  Successed!   length: 100  MaxMinAvg: 0.00264821 0.00264604 0.00264818
+  Computing center of mass ...  7211 Done
+  Computing center index ...  71 Done
+  Init Worm...  FEM material regions:
+    label 0 tets=13108 youngs_modulus=200000
+    label 1 tets=11568 youngs_modulus=400000
+ Vertices: 7950 Triangles: 98704 Tets: 24676 Countours: 14284 Constraints: 28718
+               Volume: 0.00201391 Surface Area: 0.127029 Mass: 10
+Total degree of freedom : 23850
+Total constraints : 28718
+OpenMP max threads: 32
+[PeridynoBridge] GPU excluded 97384 particles inside fish surface mesh (14284 triangles, dot(P-Q,n)>0, 2.6 ms)
+[PeridynoBridge] Initialized: 0 fluid particles, spacing=0.011, h=0.022, domain  -0.126931 -0.0816333  -0.246969 to 0.273069 0.218367 0.779437
+  substeps=4 contact(stiffness=10 damping=2) vap_hydro=on
+[Environment] GPU SPH solver initialized.
+[Environment] Fluid domain (fish-centered):  -0.126931 -0.0816333  -0.246969 to 0.273069 0.218367 0.779437  fish_center=0.0730689 0.0683667  0.266234  domain_half=     0.2     0.15 0.513203  fish_size=0.134503 0.122524 0.513203
+Avg Coord Velocity: [0, 0, 0]  0  Target Velocity: [0.205789, 0.250937, -0.00831361]  0.324634
+=== FSI snapshot ===
+seconds=1.5 sim_hz=480 t=[0.5,1.5] step=0.5 max_force=5 ramp_sec=0.5 hydro_scale=0.1 flow=(0,0,0) ghost_stride=1 ghost_div_scale=0.02 ghost_vel_scale=0.05 substeps=18 dx=0.011 torque_only=0
+[PeridynoBridge] Boundary: 7950 vertices
+[PeridynoBridge] Faces: 14284 triangles, total surface area=0.127029 m^2
+[PeridynoBridge] VAP ghost: 1270/7144 surface (stride=1, spacing_scale=1, FEM nv=7950)
+[FEM] PD iter=13 eval_ms=69.7702 solve_ms=131.664
+[2026-06-18 17:55:54.810] [WARN FEM t=0.0021s iter=1 sph_ms=1.67 fem_ms=202.18 step_ms=203.89] volume_ratio=0.999440 tet_ratio=[0.5894, 1.3800] inverted=0 total_vol=2.012777e-03 m^3 | FSI(1s n=0): contact_avg=0.00 N peak=0.0000 N, hydro_avg=0.00 N peak=0.0000 N
+[FEM] PD iter=8 eval_ms=12.563 solve_ms=82.1089
+[FEM] PD iter=6 eval_ms=7.25258 solve_ms=57.4416
+[FEM] PD iter=6 eval_ms=7.49932 solve_ms=61.3904
+warn: half-second monitor skipped (invalid snapshot) t=0.5 iter=240
+warn: snapshot invalid at iter 240
+[FEM] PD iter=9 eval_ms=20.5624 solve_ms=89.4296
+[FEM] PD iter=5 eval_ms=17.0318 solve_ms=53.6582
+[FEM] PD iter=5 eval_ms=8.04007 solve_ms=50.795
+[FEM] PD iter=5 eval_ms=7.41059 solve_ms=47.5201
+warn: half-second monitor skipped (invalid snapshot) t=1 iter=480
+warn: snapshot invalid at iter 480
+[FEM] PD iter=9 eval_ms=13.7191 solve_ms=83.6285
+[FEM] PD iter=4 eval_ms=6.46327 solve_ms=39.3676
+[FEM] PD iter=5 eval_ms=6.44338 solve_ms=50.423
+[FEM] PD iter=6 eval_ms=11.7506 solve_ms=58.702
+warn: half-second monitor skipped (invalid snapshot) t=1.5 iter=720
+warn: snapshot invalid at iter 720
+SUMMARY sim_time=1.5 avg_step_ms=77.688 last_step_ms=44.6753 max_step_ms=583.337 final_vol=0.952962 final_inverted=9 com_disp=(-9.00284e-12,-1.04705e-11,-2.798e-11) ub_disp=(-0.015042,0.0147404,0.000870839) com_disp_z=-2.798e-11 ub_disp_z=0.000870839 hydro_nonzero_surf=0/7144 hydro_nonzero_pct=0 ghost_stride=1 flow=(0,0,0)
+done. summary -> result/flow_sweep_480hz_1p5s/flow_0/run_1/torque_summary.csv
+displacement -> result/flow_sweep_480hz_1p5s/flow_0/run_1/displacement_summary.txt

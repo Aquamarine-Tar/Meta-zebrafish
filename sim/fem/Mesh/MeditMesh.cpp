@@ -6,7 +6,12 @@
 
 using namespace FEM;
 
-inline bool readMESH(FILE *mesh_file, std::vector<Eigen::Vector3d> &V, std::vector<Eigen::Vector4i> &T, std::vector<Eigen::Vector3i> &F)
+inline bool readMESH(
+	FILE *mesh_file,
+	std::vector<Eigen::Vector3d> &V,
+	std::vector<Eigen::Vector4i> &T,
+	std::vector<Eigen::Vector3i> &F,
+	std::vector<int> &tet_labels)
 {
 using namespace std;
 #ifndef LINE_MAX
@@ -18,6 +23,7 @@ using namespace std;
 	V.clear();
 	T.clear();
 	F.clear();
+	tet_labels.clear();
 
 	// eat comments at beginning of file
 	still_comments = true;
@@ -192,6 +198,7 @@ using namespace std;
 	}
 	// allocate space for tetrahedra
 	T.resize(number_of_tetrahedra, Eigen::Vector4i(0, 0, 0, 0));
+	tet_labels.resize(number_of_tetrahedra, 0);
 	// tet indices
 	int a, b, c, d;
 	for (int i = 0; i < number_of_tetrahedra; i++)
@@ -206,6 +213,7 @@ using namespace std;
 		T[i][1] = b - 1;
 		T[i][2] = c - 1;
 		T[i][3] = d - 1;
+		tet_labels[i] = extra;
 	}
 	fclose(mesh_file);
 	return true;
@@ -223,7 +231,7 @@ MeditMesh::MeditMesh(const std::string &path, const Eigen::Affine3d &transform)
 		return;
 	}
 	
-	readMESH(file, mVertices, mTetrahedrons, mTriangles);
+	readMESH(file, mVertices, mTetrahedrons, mTriangles, mTetrahedronLabels);
 
 	std::cout <<"Successed! ";
 

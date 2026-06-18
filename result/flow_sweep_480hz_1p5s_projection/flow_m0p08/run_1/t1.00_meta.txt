@@ -1,0 +1,10 @@
+sim_time=1
+iter=480
+flow_ramp=1
+com=0.06977761027 0.07307702516  0.3183410922
+center=0.05267767252  0.2223522259   0.413071996
+tau_x_surface_about_com=1.489759752
+tau_x_surface_about_center=0.4241948799
+tau_x_all_vertices_about_com=1.489759752
+torque_surface_com=  1.489759752 -0.1833248309   0.247920477
+force_sum_surface=9.199546184e-06 1.165696449e-05     7.138265239

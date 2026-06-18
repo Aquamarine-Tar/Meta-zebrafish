@@ -135,6 +135,21 @@ set_target_properties(hydro_30frame PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
 
+# VAP band 粒子逐帧追踪：用于近壁 gap / VAP 线性系统诊断
+add_executable(vap_particle_trace vap_particle_trace.test.cpp)
+target_include_directories(vap_particle_trace PRIVATE
+    ${PROJECT_SOURCE_DIR}
+    ${EIGEN3_INCLUDE_DIR}
+    ${PYTHON_INCLUDE_DIR}
+    ${Boost_INCLUDE_DIRS}
+)
+target_link_libraries(vap_particle_trace sim CUDA::cudart ${Boost_LIBRARIES} ${PYTHON_LIBRARIES})
+set_target_properties(vap_particle_trace PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+
 # FSI 稳定性测试（sin 肌肉 + 体积/翻转指标）
 add_executable(fsi_stability fsi_stability.test.cpp)
 target_include_directories(fsi_stability PRIVATE

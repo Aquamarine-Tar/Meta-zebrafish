@@ -1,0 +1,17 @@
+sim_time=1.5
+avg_step_ms=1597.781852
+last_step_ms=1719.487841
+max_step_ms=1858.15113
+final_vol=0.9756405594
+vol_shrink_pct=2.435944058
+final_inverted=6
+com_disp=-4.706068578e-08  1.352877164e-08     0.3552837943
+com_disp_z=0.3552837943
+ub_disp=0.1334302371 0.2752726585 0.4554568501
+ub_disp_z=0.4554568501
+hydro_nonzero_surf=7144
+hydro_surface_total=7144
+hydro_nonzero_pct=100
+ghost_stride=1
+flow=             0              0 -0.02500000037
+hydro_transverse_projection=1

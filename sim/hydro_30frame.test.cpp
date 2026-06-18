@@ -16,12 +16,15 @@
 
 static double g_pi = 3.14159265358979323846;
 
-static Eigen::VectorXd MakeSineActivations(Environment* env, double time_sec)
+static Eigen::VectorXd MakeSineActivations(
+    Environment* env,
+    double time_sec,
+    double amplitude,
+    double offset,
+    double temporalFrequency,
+    double spatialCycles,
+    double waveSign)
 {
-    const double amplitude = 0.25;
-    const double offset = 0.25;
-    const double temporalFrequency = 1.0;
-    const double spatialCycles = 1.0;
     const auto& muscles = env->GetCreature()->GetMuscles();
     Eigen::VectorXd activations = Eigen::VectorXd::Zero(env->GetMuscleActivationSize());
 
@@ -31,7 +34,8 @@ static Eigen::VectorXd MakeSineActivations(Environment* env, double time_sec)
         double musclePhase = (muscleIdx % 2 == 0) ? 0.0 : g_pi;
         for (int sampleIdx = 0; sampleIdx < sampleCount; ++sampleIdx) {
             double bodyPhase = 2.0 * g_pi * spatialCycles * sampleIdx / sampleCount;
-            double signal = offset + amplitude * std::sin(2.0 * g_pi * temporalFrequency * time_sec - bodyPhase + musclePhase);
+            double signal = offset + amplitude * std::sin(
+                2.0 * g_pi * temporalFrequency * time_sec + waveSign * bodyPhase + musclePhase);
             activations[idx + sampleIdx] = std::min(std::max(signal, 0.0), 1.0);
         }
         idx += sampleCount;
@@ -61,6 +65,18 @@ static std::string ArgString(int argc, char** argv, const char* key, const std::
         if (std::string(argv[i]) == key)
             return std::string(argv[i + 1]);
     return def;
+}
+
+static bool ParseFlowTriple(const std::string& text, float& vx, float& vy, float& vz)
+{
+    const size_t c1 = text.find(',');
+    const size_t c2 = (c1 == std::string::npos) ? std::string::npos : text.find(',', c1 + 1);
+    if (c1 == std::string::npos || c2 == std::string::npos)
+        return false;
+    vx = std::atof(text.substr(0, c1).c_str());
+    vy = std::atof(text.substr(c1 + 1, c2 - c1 - 1).c_str());
+    vz = std::atof(text.substr(c2 + 1).c_str());
+    return true;
 }
 
 static Eigen::Vector3d ComputeCom(const Eigen::VectorXd& positions)
@@ -101,16 +117,38 @@ int main(int argc, char** argv)
     const int frames = ArgInt(argc, argv, "--frames", 0);
     const float seconds = ArgFloat(argc, argv, "--seconds", 0.125f);
     const int sim_hz_arg = ArgInt(argc, argv, "--sim-hz", 960);
-    const float ramp_sec = ArgFloat(argc, argv, "--ramp", 0.01f);
+    const float ramp_sec = ArgFloat(argc, argv, "--ramp", 0.1f);
     const float max_force = ArgFloat(argc, argv, "--max-force", 3.0f);
+    const float hydro_scale = ArgFloat(argc, argv, "--hydro-scale", 1.0f);
     const int substeps = ArgInt(argc, argv, "--substeps", 24);
     const int ghost_stride = ArgInt(argc, argv, "--ghost-stride", 1);
     const int log_every = ArgInt(argc, argv, "--log-every", 0);  // 0=自动
     const float diag_at = ArgFloat(argc, argv, "--diag-at", -1.0f);
     const std::string diag_out = ArgString(argc, argv, "--diag-out", "vap_band_diag_t3/vap_band");
+    const std::string meta_path = ArgString(argc, argv, "--meta", "data/fish.meta");
+    const float act_amp = ArgFloat(argc, argv, "--act-amp", 0.25f);
+    const float act_offset = ArgFloat(argc, argv, "--act-offset", 0.25f);
+    const float act_freq = ArgFloat(argc, argv, "--act-freq", 1.0f);
+    const float act_cycles = ArgFloat(argc, argv, "--act-cycles", 1.0f);
+    const float wave_sign = ArgFloat(argc, argv, "--wave-sign", -1.0f);
     const int diag_step = (diag_at > 0.0f) ? (int)(diag_at * sim_hz_arg + 0.5f) : -1;
+    bool flow_override = false;
+    float flow_vx = 0.0f, flow_vy = 0.0f, flow_vz = -0.05f;
+    bool vap_full_domain = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string k = argv[i];
+        if (k == "--vap-full-domain") {
+            vap_full_domain = true;
+        } else if (i + 1 < argc && k == "--flow") {
+            if (!ParseFlowTriple(argv[++i], flow_vx, flow_vy, flow_vz)) {
+                std::cerr << "bad --flow, expected VX,VY,VZ\n";
+                return 1;
+            }
+            flow_override = true;
+        }
+    }
 
-    Environment env("data/fish.meta", false);
+    Environment env(meta_path, false);
     env.SetSimulationHz(sim_hz_arg);
     env.SetVolumeLogIntervalSteps(0);
 
@@ -123,17 +161,20 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    if (flow_override)
+        bridge->SetFlowVelocity(Eigen::Vector3d(flow_vx, flow_vy, flow_vz));
     bridge->SetSubsteps(substeps);
     bridge->SetContactParams(0.3f, 15.0f);
     bridge->SetFlowRampTime(ramp_sec);
-    bridge->SetHydroForceScale(1.0f);
+    bridge->SetHydroForceScale(hydro_scale);
     bridge->SetMaxVertexForce(max_force);
     bridge->SetEnableContactRepulsion(false);
     bridge->SetEnableHydroPressure(true);
     bridge->SetGhostSampleStride(ghost_stride);
-    const float ghost_div_scale = ArgFloat(argc, argv, "--ghost-div-scale", 1.0f);
-    const float ghost_vel_scale = ArgFloat(argc, argv, "--ghost-vel-scale", 1.0f);
+    const float ghost_div_scale = ArgFloat(argc, argv, "--ghost-div-scale", 0.25f);
+    const float ghost_vel_scale = ArgFloat(argc, argv, "--ghost-vel-scale", 0.25f);
     bridge->SetVapGhostCouplingScales(ghost_div_scale, ghost_vel_scale);
+    bridge->SetVapFullDomain(vap_full_domain);
 
     const int ctrl_hz = (int)env.GetControlHz();
     const int ratio = sim_hz / ctrl_hz;
@@ -149,6 +190,7 @@ int main(int argc, char** argv)
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "=== hydro_30frame sim_hz=" << sim_hz
+              << " meta=" << meta_path
               << " frames=" << total_frames
               << " t_sec=" << (total_frames / (double)sim_hz)
               << " ramp_sec=" << ramp_sec
@@ -159,6 +201,15 @@ int main(int argc, char** argv)
               << " hydro_scale=" << bridge->GetHydroForceScale()
               << " ghost_div_scale=" << ghost_div_scale
               << " ghost_vel_scale=" << ghost_vel_scale
+              << " act_amp=" << act_amp
+              << " act_offset=" << act_offset
+              << " act_freq=" << act_freq
+              << " act_cycles=" << act_cycles
+              << " wave_sign=" << wave_sign
+              << " flow=(" << bridge->GetFlowVelocity().x()
+              << "," << bridge->GetFlowVelocity().y()
+              << "," << bridge->GetFlowVelocity().z() << ")"
+              << " vap_full_domain=" << (vap_full_domain ? 1 : 0)
               << " ===\n";
 
     Eigen::Vector3d com0 = ComputeCom(env.GetSoftWorld()->GetPositions());
@@ -171,7 +222,8 @@ int main(int argc, char** argv)
     for (int step = 0; step < total_frames; ++step) {
         if (step % ratio == 0) {
             const double t = step / (double)sim_hz;
-            env.GetCreature()->SetActivationLevelsDirectly(MakeSineActivations(&env, t));
+            env.GetCreature()->SetActivationLevelsDirectly(
+                MakeSineActivations(&env, t, act_amp, act_offset, act_freq, act_cycles, wave_sign));
             env.SetPhase(step / ratio);
         }
 
@@ -249,6 +301,7 @@ int main(int argc, char** argv)
               << " ghost_count=" << bridge->GetGhostVertexCount()
               << " ghost_div_scale=" << ghost_div_scale
               << " ghost_vel_scale=" << ghost_vel_scale
+              << " vap_full_domain=" << (vap_full_domain ? 1 : 0)
               << " roll_hydro_avg=" << fsi.hydro_total_avg_n
               << " roll_hydro_peak=" << fsi.hydro_peak_n
               << "\n";

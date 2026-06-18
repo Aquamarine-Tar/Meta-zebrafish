@@ -7,8 +7,8 @@
 #endif
 
 #define MAX_VAP_NEIGHBORS   128
-#define VAP_GHOST_NEIGHBOR_RESERVE  16
-#define VAP_BAND_H_MULT     5.0f
+#define VAP_GHOST_NEIGHBOR_RESERVE  8
+#define VAP_BAND_H_MULT     2.5f
 #define VAP_CG_MAX_ITER     50
 #define VAP_CG_TOL          0.1f
 #define VAP_SEPARATION      0.1f
@@ -19,8 +19,11 @@
 #define VAP_ATTR_FLUID             0u
 #define VAP_ATTR_KINEMATIC_GHOST   2u
 // VAP 压力场 → 面力积分前的全局缩放（Tait 与投影压量纲不同，需远小于 1）
-#define VAP_PRESSURE_TO_HYDRO      1.0f
+#define VAP_PRESSURE_TO_HYDRO      0.75f
 #define VAP_PRESSURE_ABS_MAX       500000.0f
+#define VAP_PROJECTION_PRESSURE_ABS_MAX 35000.0f
+#define VAP_SOURCE_RELAXATION      0.015f
+#define VAP_MAX_PROJECTION_SHIFT_DX 0.35f
 /** ghost 邻居在 AiiTotal 中的对角权重（Peridyno 静态壁默认 2.0） */
 #define VAP_GHOST_DIAG_COEFF       1.0f
 
@@ -41,9 +44,55 @@ __device__ float vap_wrr(float r, float h) {
     return vap_poly6_w(r * r, h, h * h) / (r * r + 1e-8f);
 }
 
+__device__ float3 vap_closest_point_triangle(
+    const float3& A, const float3& B, const float3& C, const float3& P)
+{
+    const float3 ab = B - A;
+    const float3 ac = C - A;
+    const float3 ap = P - A;
+    const float d1 = dot(ab, ap);
+    const float d2 = dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) return A;
+
+    const float3 bp = P - B;
+    const float d3 = dot(ab, bp);
+    const float d4 = dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) return B;
+
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        const float v = d1 / fmaxf(d1 - d3, 1e-12f);
+        return A + ab * v;
+    }
+
+    const float3 cp = P - C;
+    const float d5 = dot(ab, cp);
+    const float d6 = dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) return C;
+
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        const float w = d2 / fmaxf(d2 - d6, 1e-12f);
+        return A + ac * w;
+    }
+
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        const float w = (d4 - d3) / fmaxf((d4 - d3) + (d5 - d6), 1e-12f);
+        return B + (C - B) * w;
+    }
+
+    const float denom = 1.0f / fmaxf(va + vb + vc, 1e-12f);
+    const float v = vb * denom;
+    const float w = vc * denom;
+    return A + ab * v + ac * w;
+}
+
 __global__ void vap_mark_band_kernel(
     unsigned char* band_mask,
     const float3* fluid_pos,
+    const float3* boundary_vertices,
+    const int3* face_indices,
     const float3* face_centers,
     const int* face_grid_particles,
     GridParams fgp,
@@ -55,7 +104,7 @@ __global__ void vap_mark_band_kernel(
     if (idx >= num_fluid) return;
     float3 p = fluid_pos[idx];
     // 面网格 cell_size = particle_spacing = Δx ≈ h/2
-    // band_h = h * VAP_BAND_H_MULT ≈ 5Δx → 需搜索 ±ceil(band_h/cell_size) ≈ ±5 格
+    // band_h = h * VAP_BAND_H_MULT ≈ 2.5h → 需搜索 ±ceil(band_h/cell_size) 格
     int search_r = (int)ceilf(band_h * fgp.inv_cell_size) + 1;
     int cx = max(0, min((int)((p.x - fgp.grid_min.x) * fgp.inv_cell_size), fgp.grid_dim.x - 1));
     int cy = max(0, min((int)((p.y - fgp.grid_min.y) * fgp.inv_cell_size), fgp.grid_dim.y - 1));
@@ -70,7 +119,10 @@ __global__ void vap_mark_band_kernel(
                 for (int c = 0; c < MAX_FACES_PER_CELL; c++) {
                     int f = face_grid_particles[cell * MAX_FACES_PER_CELL + c];
                     if (f < 0) break;
-                    float3 d = p - face_centers[f];
+                    const int3 fi = face_indices[f];
+                    const float3 q = vap_closest_point_triangle(
+                        boundary_vertices[fi.x], boundary_vertices[fi.y], boundary_vertices[fi.z], p);
+                    float3 d = p - q;
                     if (dot(d, d) <= band_h * band_h) {
                         band_mask[idx] = 1;
                         return;
@@ -82,6 +134,70 @@ __global__ void vap_mark_band_kernel(
 __global__ void vap_clear_uchar_kernel(unsigned char* arr, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) arr[i] = 0;
+}
+
+/** 全域 VAP：不做窄带筛选，所有流体粒子参与投影 */
+__global__ void vap_mark_all_kernel(unsigned char* band_mask, int num_fluid) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < num_fluid) band_mask[i] = 1;
+}
+
+__global__ void vap_boundary_layer_shift_kernel(
+    float3* fluid_pos,
+    const unsigned char* band_mask,
+    const float3* boundary_vertices,
+    const int3* face_indices,
+    const int* face_grid_particles,
+    GridParams fgp,
+    float band_h,
+    float target_dist,
+    float deadband,
+    float strength,
+    float max_shift,
+    int num_fluid)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_fluid) return;
+    if (band_mask && !band_mask[idx]) return;
+
+    float3 p = fluid_pos[idx];
+    int search_r = (int)ceilf(band_h * fgp.inv_cell_size) + 1;
+    int cx = max(0, min((int)((p.x - fgp.grid_min.x) * fgp.inv_cell_size), fgp.grid_dim.x - 1));
+    int cy = max(0, min((int)((p.y - fgp.grid_min.y) * fgp.inv_cell_size), fgp.grid_dim.y - 1));
+    int cz = max(0, min((int)((p.z - fgp.grid_min.z) * fgp.inv_cell_size), fgp.grid_dim.z - 1));
+
+    float best_d2 = band_h * band_h;
+    float3 best_q = p;
+    for (int dz = -search_r; dz <= search_r; dz++)
+        for (int dy = -search_r; dy <= search_r; dy++)
+            for (int dx = -search_r; dx <= search_r; dx++) {
+                int nx = cx + dx, ny = cy + dy, nz = cz + dz;
+                if (nx < 0 || nx >= fgp.grid_dim.x || ny < 0 || ny >= fgp.grid_dim.y || nz < 0 || nz >= fgp.grid_dim.z)
+                    continue;
+                int cell = nz * fgp.grid_dim.x * fgp.grid_dim.y + ny * fgp.grid_dim.x + nx;
+                for (int c = 0; c < MAX_FACES_PER_CELL; c++) {
+                    int f = face_grid_particles[cell * MAX_FACES_PER_CELL + c];
+                    if (f < 0) break;
+                    const int3 fi = face_indices[f];
+                    const float3 q = vap_closest_point_triangle(
+                        boundary_vertices[fi.x], boundary_vertices[fi.y], boundary_vertices[fi.z], p);
+                    const float3 d = p - q;
+                    const float d2 = dot(d, d);
+                    if (d2 < best_d2) {
+                        best_d2 = d2;
+                        best_q = q;
+                    }
+                }
+            }
+
+    const float dist = sqrtf(best_d2);
+    if (dist < 1e-6f) return;
+    if (fabsf(dist - target_dist) <= deadband) return;
+
+    const float3 dir = (p - best_q) * (1.0f / dist);
+    float shift = strength * (target_dist - dist);
+    shift = fmaxf(-max_shift, fminf(max_shift, shift));
+    fluid_pos[idx] = p + dir * shift;
 }
 
 __global__ void vap_reset_counter_kernel(int* counter) {
@@ -227,26 +343,50 @@ __global__ void vap_build_neighbors_kernel(
     int ghost_cnt = 0;
     int fluid_cnt = 0;
     const int max_fluid = MAX_VAP_NEIGHBORS - VAP_GHOST_NEIGHBOR_RESERVE;
+    int ghost_best[VAP_GHOST_NEIGHBOR_RESERVE];
+    float ghost_best_d2[VAP_GHOST_NEIGHBOR_RESERVE];
+    for (int k = 0; k < VAP_GHOST_NEIGHBOR_RESERVE; ++k) {
+        ghost_best[k] = -1;
+        ghost_best_d2[k] = 1e30f;
+    }
 
-    // 先收集 ghost，再收集 fluid，避免 48/128 上限把 ghost 挤掉
+    // 先选半径内最近的少量 ghost，再收集 fluid；避免高密度表面 ghost 按网格遍历顺序随机主导。
     for (int dz = -search_r; dz <= search_r; dz++)
         for (int dy = -search_r; dy <= search_r; dy++)
             for (int dx = -search_r; dx <= search_r; dx++) {
-                if (ghost_cnt >= VAP_GHOST_NEIGHBOR_RESERVE) break;
                 int nx = cx + dx, ny = cy + dy, nz = cz + dz;
                 if (nx < 0 || nx >= gp.grid_dim.x || ny < 0 || ny >= gp.grid_dim.y || nz < 0 || nz >= gp.grid_dim.z)
                     continue;
                 int cell = nz * gp.grid_dim.x * gp.grid_dim.y + ny * gp.grid_dim.x + nx;
-                for (int c = 0; c < VAP_MAX_MERGED_CELL && ghost_cnt < VAP_GHOST_NEIGHBOR_RESERVE; c++) {
+                for (int c = 0; c < VAP_MAX_MERGED_CELL; c++) {
                     int j = grid_particles[cell * VAP_MAX_MERGED_CELL + c];
                     if (j < 0) break;
                     if (j == i || merged_attr[j] != VAP_ATTR_KINEMATIC_GHOST) continue;
                     float3 r = pi - merged_pos[j];
-                    float dist = length(r);
-                    if (dist >= h || dist < 1e-8f) continue;
-                    neighbors[base + ghost_cnt++] = j;
+                    float d2 = dot(r, r);
+                    if (d2 >= h * h || d2 < 1e-16f) continue;
+                    if (ghost_cnt < VAP_GHOST_NEIGHBOR_RESERVE) {
+                        ghost_best[ghost_cnt] = j;
+                        ghost_best_d2[ghost_cnt] = d2;
+                        ghost_cnt++;
+                    } else {
+                        int worst = 0;
+                        float worst_d2 = ghost_best_d2[0];
+                        for (int k = 1; k < VAP_GHOST_NEIGHBOR_RESERVE; ++k) {
+                            if (ghost_best_d2[k] > worst_d2) {
+                                worst = k;
+                                worst_d2 = ghost_best_d2[k];
+                            }
+                        }
+                        if (d2 < worst_d2) {
+                            ghost_best[worst] = j;
+                            ghost_best_d2[worst] = d2;
+                        }
+                    }
                 }
             }
+    for (int k = 0; k < ghost_cnt; ++k)
+        neighbors[base + k] = ghost_best[k];
 
     for (int dz = -search_r; dz <= search_r && fluid_cnt < max_fluid; dz++)
         for (int dy = -search_r; dy <= search_r && fluid_cnt < max_fluid; dy++)
@@ -268,7 +408,6 @@ __global__ void vap_build_neighbors_kernel(
 
     // 紧凑排列：ghost 在前，fluid 紧随其后
     if (ghost_cnt < VAP_GHOST_NEIGHBOR_RESERVE && fluid_cnt > 0) {
-        const int shift = VAP_GHOST_NEIGHBOR_RESERVE - ghost_cnt;
         for (int k = 0; k < fluid_cnt; ++k)
             neighbors[base + ghost_cnt + k] = neighbors[base + VAP_GHOST_NEIGHBOR_RESERVE + k];
     }
@@ -497,6 +636,7 @@ __global__ void vap_update_velocity_kernel(
     float h,
     float dt,
     float ghost_vel_scale,
+    float max_delta_v,
     int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -530,6 +670,9 @@ __global__ void vap_update_velocity_kernel(
             dv = dv + ghost_vel_scale * w * dot(vel[j] - vel[i], r) * r;
         }
     }
+    const float dv_len = length(dv);
+    if (dv_len > max_delta_v && dv_len > 1e-8f)
+        dv = dv * (max_delta_v / dv_len);
     vel[i] = vel[i] + dv;
 }
 
@@ -554,6 +697,14 @@ __global__ void vap_clamp_scale_pressure_kernel(
     if (!isfinite(p)) p = 0.0f;
     p = fmaxf(-abs_max, fminf(abs_max, p));
     pressure[i] = p * scale;
+}
+
+__global__ void vap_scale_kernel(float* values, const unsigned char* attr, float scale, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (attr && attr[i] == VAP_ATTR_KINEMATIC_GHOST) return;
+    values[i] *= scale;
 }
 
 __global__ void vap_scatter_pressure_back_kernel(
@@ -620,6 +771,20 @@ __global__ void integrate_position_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     positions[i] = positions[i] + velocities[i] * dt;
+}
+
+__global__ void vap_clamp_fluid_velocity_kernel(float3* velocities, float max_speed, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float3 v = velocities[i];
+    if (!isfinite(v.x) || !isfinite(v.y) || !isfinite(v.z)) {
+        velocities[i] = make_float3(0, 0, 0);
+        return;
+    }
+    const float speed = length(v);
+    if (speed > max_speed && speed > 1e-8f)
+        velocities[i] = v * (max_speed / speed);
 }
 
 __global__ void vap_dot_kernel(const float* a, const float* b, float* partial, int n) {
